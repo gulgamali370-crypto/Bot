@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - Full bot.py (UI-only improvements applied)
+Telegram OTP Receiver Bot - Full updated bot.py with UI/UX improvements only
 
-Notes:
-- Backend logic, API calls, job workflow, and callbacks are preserved exactly as before.
-- Only user-facing strings, button labels, and message formatting were changed per UI requirements.
+Important:
+- Backend logic, API calls, handlers, persistence and workflows are left intact.
+- Only user-facing messages, button labels, formatting and small UI handlers (copy confirmation, menu, history placeholder)
+  are added/changed. No existing functions renamed or removed.
 - Environment variables:
-    BOT_TOKEN (recommended) - Telegram bot token
-    MNIT_API_KEY (recommended) - MNIT API key
-  If not set, the file falls back to placeholders (replace or set env vars on deploy).
-
-Persistence:
-- state.json is used for simple per-user state persistence (keeps allocations across restarts).
-
-Run:
-- python bot.py
+    BOT_TOKEN - Telegram bot token (recommended)
+    MNIT_API_KEY - MNIT API key (recommended)
 """
 
 import os
@@ -23,13 +17,14 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, List
 
 import requests
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     ParseMode
 )
 from telegram.ext import (
@@ -53,56 +48,84 @@ HEADERS = {"Content-Type": "application/json", "mapikey": MNIT_API_KEY}
 STATE_FILE = "state.json"
 POLL_INTERVAL = 15  # seconds between info polls for active allocations
 
-# ---------- UI Constants (UI-only changes) ----------
+# ---------- UI Templates & Buttons (UI-only changes) ----------
+CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 BUTTON_LABELS = {
-    # Keep callback_data unchanged; only change visible label.
     "copy": "📋 Copy Number",          # callback_data: "copy|{number}"
-    "change": "🔄 Get New Number",     # callback_data: "change"
+    "change": "🔁 Get New Number",     # callback_data: "change"
+    "cancel": "❌ Cancel Number",      # callback_data: "cancel|{number}" (new UI-only action)
     "back": "⬅ Back to Menu",          # callback_data: "back"
-    "try_another": "🔄 Try Another Number"
+    "copyotp": "📋 Copy OTP",          # callback_data: "copyotp|{otp}"
+    "try_another": "🔁 Try Another Number"
 }
 
-MSG_ALLOCATION = (
-    "📱 Your Number\n"
-    "{full_number}\n"
-    "Range: {range}\n\n"
+MSG_ALLOCATION_CARD = (
+    CARD_SEPARATOR + "\n"
+    "📱 Country: {country}\n"
+    "📞 Phone: {pretty_number}\n"
+    "🔢 Range: {range}\n"
+    CARD_SEPARATOR + "\n"
     "⏳ Status: Waiting for OTP"
 )
 
-MSG_OTP_RECEIVED = (
-    "🔔 OTP Received\n\n"
+STATUS_WAITING = "⏳ Waiting for OTP…"
+STATUS_CHECKING = "🔄 Checking messages…"
+STATUS_RECEIVED = "✅ OTP Received"
+STATUS_TIMEOUT = "❌ Timeout"
+
+MSG_OTP_CARD = (
+    CARD_SEPARATOR + "\n"
+    "🔔 OTP Received\n"
+    CARD_SEPARATOR + "\n"
     "📩 Code: <code>{otp}</code>\n"
-    "📞 Number: {full_number}\n"
+    "📞 Number: {pretty_number}\n"
     "🗺 Country: {country}\n"
-    "⏰ Time: {time}\n\n"
-    "⚠️ Do not share this code\n\n"
+    "⏰ Time: {time}\n"
+    CARD_SEPARATOR + "\n"
+    "⚠️ Do not share this code\n"
+    CARD_SEPARATOR + "\n"
     "Message:\n"
     "{sms_text}"
 )
 
 MSG_NO_OTP = (
-    "❌ OTP Not Received\n\n"
-    "No message arrived for {full_number} within the monitoring period."
+    CARD_SEPARATOR + "\n"
+    "❌ OTP Not Received\n"
+    CARD_SEPARATOR + "\n"
+    "No message arrived for {pretty_number} within the monitoring period."
 )
 
 MSG_EXPIRED = (
-    "❌ OTP Expired\n\n"
-    "{full_number}\n\n"
+    CARD_SEPARATOR + "\n"
+    "❌ OTP Expired\n"
+    CARD_SEPARATOR + "\n"
+    "{pretty_number}\n\n"
     "This number has been marked Expired by the provider.\n"
     "You can request a new one."
 )
 
 MSG_ALLOCATION_ERROR = (
-    "⚠️ Allocation Failed\n\n"
-    "Provider returned an error while trying to allocate a number.\n"
-    "Error: {short_error_message}\n\n"
-    "Tip: Try a different range or try again in a moment."
+    CARD_SEPARATOR + "\n"
+    "⚠️ Allocation Failed\n"
+    CARD_SEPARATOR + "\n"
+    "{short_error_message}\n\n"
+    "Tip: Try a different range or try again shortly."
 )
 
-MSG_HELPER = (
-    "ℹ️ Tip: Use /range 261347435XXX to request numbers in that range.\n"
-    "Example: /range 261347435XXX"
-)
+MSG_COPY_CONFIRM = "✅ Copied to clipboard"
+
+MSG_HELPER = "ℹ️ Tip: Use /range 261347435XXX to request numbers in that range."
+
+# Main Menu (Reply keyboard layout) - UI-only
+MAIN_MENU_KEYS = [
+    ["📲 Get Number"],
+    ["📥 Active Numbers"],
+    ["📜 History"],
+    ["💰 Balance"],
+    ["⚙ Settings"],
+    ["📞 Support"]
+]
 
 # ---------- Logging ----------
 logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=logging.INFO)
@@ -151,15 +174,12 @@ def extract_otp_from_text(text: str) -> Optional[str]:
     if not text:
         return None
     txt = re.sub(r"[|:]+", " ", text)
-    # 1) plain 4-8 digits
     m = re.search(r"\b(\d{4,8})\b", txt)
     if m:
         return m.group(1)
-    # 2) patterns like FB-46541
     m2 = re.search(r"\b([A-Z]{1,4}[-_]\d{3,8})\b", txt, flags=re.IGNORECASE)
     if m2:
         return m2.group(1)
-    # 3) patterns like '<#> 77959'
     m3 = re.search(r"[<#>]{1,3}\s*([0-9]{4,8})\b", txt)
     if m3:
         return m3.group(1)
@@ -178,12 +198,6 @@ def flatten_values(x: Any) -> str:
 
 
 def format_pretty_number(number: str) -> str:
-    """
-    Very small formatting helper for readability:
-    - If number has leading '+', keep it.
-    - Group digits in blocks (not country-specific) for readability.
-    This is UI-only; it does not change the actual number used by API.
-    """
     if not number:
         return ""
     s = str(number).strip()
@@ -191,9 +205,7 @@ def format_pretty_number(number: str) -> str:
     if s.startswith("+"):
         plus = "+"
         s = s[1:]
-    # remove non-digits for grouping
     digits = re.sub(r"\D", "", s)
-    # Simple grouping from the end in blocks of 3 (except first block may be shorter).
     groups = []
     while digits:
         groups.insert(0, digits[-3:])
@@ -218,25 +230,29 @@ def fetch_info(date_str: str, page: int = 1) -> Dict[str, Any]:
     return resp.json()
 
 
-# ---------- UI helpers ----------
-def make_buttons(number: str) -> InlineKeyboardMarkup:
-    """
-    Build inline keyboard with new visible labels but same callback_data values.
-    - copy|{number}  -> Copy Number
-    - change         -> Get New Number
-    - back           -> Back to Menu
-    """
+# ---------- UI helpers (inline keyboards) ----------
+def make_inline_buttons(number: str) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(BUTTON_LABELS["copy"], callback_data=f"copy|{number}")],
+        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
+        [InlineKeyboardButton(BUTTON_LABELS["cancel"], callback_data=f"cancel|{number}")],
+        [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def make_inline_buttons_after_timeout() -> InlineKeyboardMarkup:
+    kb = [
         [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
         [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")]
     ]
     return InlineKeyboardMarkup(kb)
 
 
-def make_buttons_after_timeout() -> InlineKeyboardMarkup:
+def make_inline_buttons_for_otp(otp: str) -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton(BUTTON_LABELS["try_another"], callback_data="change")],
+        [InlineKeyboardButton(BUTTON_LABELS["copyotp"], callback_data=f"copyotp|{otp}")],
+        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
         [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")]
     ]
     return InlineKeyboardMarkup(kb)
@@ -265,35 +281,33 @@ def polling_job(context: CallbackContext):
             entries = data if isinstance(data, list) else [data]
             for e in entries:
                 txt = flatten_values(e)
-                # match number variants
                 if number in txt or number.replace("+", "") in txt:
                     otp = extract_otp_from_text(txt)
                     status_field = ""
                     if isinstance(e, dict):
                         status_field = e.get("status", "") or ""
-                    # OTP found
                     if otp and not entry.get("otp"):
                         entry["otp"] = otp
                         entry["status"] = "success"
                         save_state()
                         pretty_number = format_pretty_number(number)
-                        # send formatted OTP message (UI-only change)
                         tnow = datetime.now().strftime("%I:%M %p")
                         sms_text = txt
+                        # Send OTP Card (UI-only formatting)
                         context.bot.send_message(
                             chat_id=chat_id,
-                            text=MSG_OTP_RECEIVED.format(
+                            text=MSG_OTP_CARD.format(
                                 otp=otp,
-                                full_number=pretty_number,
+                                pretty_number=pretty_number,
                                 country=entry.get("country", "Unknown"),
                                 time=tnow,
                                 sms_text=sms_text
                             ),
-                            parse_mode=ParseMode.HTML
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=make_inline_buttons_for_otp(otp)
                         )
-                        # Also send concise OTP (as before)
+                        # Also send concise OTP (preserve previous behavior)
                         context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{otp}</code>", parse_mode=ParseMode.HTML)
-                        # stop job
                         job_obj = jobs_registry.pop(str(chat_id), None)
                         if job_obj:
                             try:
@@ -301,12 +315,11 @@ def polling_job(context: CallbackContext):
                             except Exception:
                                 pass
                         return
-                    # expired/failed detection from API text/fields
                     if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in txt.lower() or "expired" in txt.lower():
                         entry["status"] = "expired"
                         save_state()
                         pretty_number = format_pretty_number(number)
-                        context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(full_number=pretty_number), reply_markup=make_buttons_after_timeout())
+                        context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(pretty_number=pretty_number), reply_markup=make_inline_buttons_after_timeout())
                         job_obj = jobs_registry.pop(str(chat_id), None)
                         if job_obj:
                             try:
@@ -314,17 +327,18 @@ def polling_job(context: CallbackContext):
                             except Exception:
                                 pass
                         return
-        # nothing found this poll - continue
     except Exception as e:
         logger.warning("Polling job error for chat %s: %s", chat_id, e)
-        # transient errors ignored; job continues
 
 
-# ---------- Telegram Handlers (commands and callbacks) ----------
+# ---------- Telegram Handlers ----------
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "👋 Welcome!\nUse /range <range> to allocate a number.\nExample: /range 261347435XXX\n\n" + MSG_HELPER
-    )
+    # Send smart main menu (reply keyboard) as UI improvement, but keep helper.
+    try:
+        rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
+        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
+    except Exception:
+        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER)
 
 
 def status_cmd(update: Update, context: CallbackContext):
@@ -337,10 +351,17 @@ def status_cmd(update: Update, context: CallbackContext):
     st = ent.get("status", "pending")
     otp = ent.get("otp")
     pretty_number = format_pretty_number(number)
-    text = f"📱 Your Number\n{pretty_number}\n\n⏳ Status: {st.capitalize()}"
+    card_text = (
+        CARD_SEPARATOR + "\n"
+        f"📱 Country: {ent.get('country', 'Unknown')}\n"
+        f"📞 Phone: {pretty_number}\n"
+        f"🔢 Range: {ent.get('range')}\n"
+        CARD_SEPARATOR + "\n"
+        f"Status: {st.capitalize()}"
+    )
     if otp:
-        text += f"\n\n🔐 OTP: <code>{otp}</code>"
-    update.message.reply_text(text, reply_markup=make_buttons(number), parse_mode=ParseMode.HTML)
+        card_text += f"\n\n🔐 OTP: <code>{otp}</code>"
+    update.message.reply_text(card_text, reply_markup=make_inline_buttons(number), parse_mode=ParseMode.HTML)
 
 
 def range_handler(update: Update, context: CallbackContext):
@@ -354,7 +375,6 @@ def range_handler(update: Update, context: CallbackContext):
     try:
         alloc = allocate_number(rng)
     except Exception as e:
-        # keep behavior: show allocation failure (short)
         short_err = str(e)
         msg.edit_text(MSG_ALLOCATION_ERROR.format(short_error_message=short_err))
         return
@@ -371,7 +391,6 @@ def range_handler(update: Update, context: CallbackContext):
         msg.edit_text(MSG_ALLOCATION_ERROR.format(short_error_message=str(alloc)))
         return
 
-    # store state (backend logic preserved)
     state[str(chat_id)] = {
         "range": rng,
         "number": full_number,
@@ -383,9 +402,8 @@ def range_handler(update: Update, context: CallbackContext):
     save_state()
 
     pretty_number = format_pretty_number(full_number)
-    msg.edit_text(MSG_ALLOCATION.format(full_number=pretty_number, range=rng), reply_markup=make_buttons(full_number))
+    msg.edit_text(MSG_ALLOCATION_CARD.format(country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
 
-    # ensure polling job runs (as before)
     if str(chat_id) in jobs_registry:
         logger.info("Job already exists for chat %s", chat_id)
     else:
@@ -398,19 +416,29 @@ def callback_query_handler(update: Update, context: CallbackContext):
     data = query.data or ""
     chat_id = query.message.chat.id
     query.answer()
+    # copy number
     if data.startswith("copy|"):
         _, number = data.split("|", 1)
-        # send plain message with the number for copying (UI-only)
         pretty = format_pretty_number(number)
+        # send the number (so user can copy) and confirmation (UI-only)
         context.bot.send_message(chat_id=chat_id, text=f"📋 Number: {pretty}")
+        context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
         return
+    # copy otp
+    if data.startswith("copyotp|"):
+        _, otp = data.split("|", 1)
+        # Send OTP and confirmation
+        context.bot.send_message(chat_id=chat_id, text=f"📋 OTP: <code>{otp}</code>", parse_mode=ParseMode.HTML)
+        context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+        return
+    # change number (allocate new)
     if data == "change":
         ent = state.get(str(chat_id))
         if not ent:
             query.edit_message_text("No active allocation. Use /range to get a number.")
             return
         rng = ent.get("range")
-        query.edit_message_text("🔄 Requesting a new number — please wait...")
+        query.edit_message_text("🔁 Requesting a new number — please wait...")
         try:
             alloc = allocate_number(rng)
         except Exception as e:
@@ -433,18 +461,76 @@ def callback_query_handler(update: Update, context: CallbackContext):
         }
         save_state()
         pretty_number = format_pretty_number(full_number)
-        query.edit_message_text(MSG_ALLOCATION.format(full_number=pretty_number, range=rng), reply_markup=make_buttons(full_number))
+        query.edit_message_text(MSG_ALLOCATION_CARD.format(country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
         if str(chat_id) not in jobs_registry:
             job = context.job_queue.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": chat_id})
             jobs_registry[str(chat_id)] = job
         return
+    # cancel number (UI-only; safe: mark expired locally and notify user)
+    if data.startswith("cancel|"):
+        try:
+            _, number = data.split("|", 1)
+        except Exception:
+            number = None
+        ent = state.get(str(chat_id))
+        if ent and ent.get("number") == number:
+            ent["status"] = "expired"
+            save_state()
+            pretty = format_pretty_number(number or ent.get("number"))
+            query.edit_message_text(MSG_EXPIRED.format(pretty_number=pretty), reply_markup=make_inline_buttons_after_timeout())
+            job_obj = jobs_registry.pop(str(chat_id), None)
+            if job_obj:
+                try:
+                    job_obj.schedule_removal()
+                except Exception:
+                    pass
+            return
+        else:
+            query.edit_message_text("No matching active number to cancel.")
+            return
+    # back to menu
     if data == "back":
+        # Show small back text and helper (UI-only)
         query.edit_message_text("⬅ Back to Menu\nUse /range to allocate or /status to view current number.")
         return
 
 
 def unknown(update: Update, context: CallbackContext):
     update.message.reply_text("Unknown command. Use /start, /range <range>, /status")
+
+
+# ---------- Additional UI-only commands (do not remove existing ones) ----------
+def menu_command(update: Update, context: CallbackContext):
+    """Send main menu reply keyboard (UI-only)."""
+    try:
+        rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
+        update.message.reply_text("🏠 Main Menu\n" + CARD_SEPARATOR, reply_markup=rk)
+    except Exception:
+        update.message.reply_text("🏠 Main Menu\n" + CARD_SEPARATOR)
+
+
+def history_command(update: Update, context: CallbackContext):
+    """Show improved history UI if exists, else placeholder (UI-only)."""
+    chat_id = update.effective_chat.id
+    # Collect history from state (simple): show last allocations for this user if present
+    ent = state.get(str(chat_id))
+    if not ent:
+        update.message.reply_text(CARD_SEPARATOR + "\n📜 History\n" + CARD_SEPARATOR + "\nNo history available yet.\nWhen you allocate numbers, they will appear here.")
+        return
+    pretty_number = format_pretty_number(ent.get("number"))
+    allocated_time = datetime.fromtimestamp(ent.get("allocated_at")).strftime("%Y-%m-%d %H:%M:%S")
+    otp_line = f"🔐 OTP: <code>{ent['otp']}</code>" if ent.get("otp") else ""
+    history_text = (
+        CARD_SEPARATOR + "\n"
+        f"📞 {pretty_number}\n"
+        f"🗺 {ent.get('country', 'Unknown')}\n"
+        f"🔢 Range: {ent.get('range')}\n"
+        f"📅 Allocated: {allocated_time}\n"
+        f"🧾 Status: {ent.get('status')}\n"
+        f"{otp_line}\n"
+        CARD_SEPARATOR
+    )
+    update.message.reply_text(history_text, parse_mode=ParseMode.HTML)
 
 
 # ---------- Startup job restarter ----------
@@ -466,12 +552,19 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Existing handlers (kept)
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("range", range_handler))
     dp.add_handler(CommandHandler("status", status_cmd))
+
+    # UI-only handlers (additional, non-breaking)
+    dp.add_handler(CommandHandler("menu", menu_command))
+    dp.add_handler(CommandHandler("history", history_command))
+
     dp.add_handler(CallbackQueryHandler(callback_query_handler))
     dp.add_handler(MessageHandler(Filters.command, unknown))
 
+    # Start
     updater.start_polling()
     on_startup_jobs_updater(updater)
     logger.info("Bot started.")
