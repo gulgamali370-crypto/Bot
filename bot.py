@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - Robust OTP forwarding and copy behavior
+Telegram OTP Receiver Bot - Forward OTP to user + group, improved matching
 
-What changed (focus on fixes you requested):
-- Improved matching of allocation entries with API info records (checks `number`, `copy` and digit-only match).
-- Extracts message from common keys (`message`, `sms`, `msg`, `text`, `body`) if present and forwards full message.
-- Stronger parsing - tries multiple recent dates/pages to find SMS quickly.
-- Copy button uses CallbackQuery.answer(show_alert=True) (user can copy from alert) AND sends a plain message containing the number/OTP so mobile long-press copy works reliably.
-- Added defensive logging around API responses to help debug missing matches.
-- No other files changed.
+Changes:
+- Forwards OTP and full message to the requesting user AND to a forwarding group (FORWARD_CHAT_ID).
+- More aggressive recursive matching of allocated number in API info entries.
+- Additional extraction attempts for message text from common keys and nested structures.
+- Keeps copy behavior: shows alert and sends a plain message for long-press copy.
+- No new external dependencies required beyond requirements.txt.
 
-Note: Bots cannot programmatically write to a user's clipboard. Showing an alert and sending the number text is the reliable UX for copying on mobile.
+Environment:
+- BOT_TOKEN (recommended)
+- MNIT_API_KEY (recommended)
+- FORWARD_CHAT_ID (optional, default: -1003379113224 from user request)
+
+Deploy: replace existing bot.py with this file and restart bot.
 """
 import os
 import re
@@ -41,6 +45,8 @@ from telegram.ext import (
 # ---------- CONFIG ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "7108794200:AAGWA3aGPDjdYkXJ1VlOSdxBMHtuFpWzAIU"
 MNIT_API_KEY = os.getenv("MNIT_API_KEY") or "M_WH9Q3U88V"
+# Forwarding group/chat ID (use env to override). Default from user's request.
+FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 
 ALLOCATE_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/number"
 INFO_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info"
@@ -48,7 +54,7 @@ INFO_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info"
 HEADERS = {"Content-Type": "application/json", "mapikey": MNIT_API_KEY}
 
 STATE_FILE = "state.json"
-POLL_INTERVAL = 12  # seconds between info polls for active allocations
+POLL_INTERVAL = 12  # seconds between polls
 
 # ---------- UI Templates & Buttons ----------
 CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -165,12 +171,15 @@ def extract_otp_from_text(text: str) -> Optional[str]:
     if not text:
         return None
     txt = re.sub(r"[|:]+", " ", text)
+    # common numeric OTPs
     m = re.search(r"\b(\d{4,8})\b", txt)
     if m:
         return m.group(1)
-    m2 = re.search(r"\b([A-Z]{1,4}[-_]\d{3,8})\b", txt, flags=re.IGNORECASE)
+    # codes with prefix e.g., AB-1234
+    m2 = re.search(r"\b([A-Z0-9]{1,6}[-_]\d{3,8})\b", txt, flags=re.IGNORECASE)
     if m2:
         return m2.group(1)
+    # symbols like <#> 123456
     m3 = re.search(r"[<#>]{1,3}\s*([0-9]{4,8})\b", txt)
     if m3:
         return m3.group(1)
@@ -189,12 +198,13 @@ def flatten_values(x: Any) -> str:
 
 
 def extract_message_text(entry: Dict[str, Any]) -> str:
-    # Common keys from API responses
-    for k in ("message", "sms", "msg", "text", "body", "sms_text"):
+    # look for common keys that hold SMS/message content
+    for k in ("message", "sms", "msg", "text", "body", "sms_text", "content"):
         v = entry.get(k)
         if v:
             return flatten_values(v)
-    # fallback to flatten whole entry
+    # search nested for strings resembling an SMS (heuristic)
+    # flatten and return whole flattened entry as fallback
     return flatten_values(entry)
 
 
@@ -270,10 +280,10 @@ def polling_job(context: CallbackContext):
     if not number:
         return
 
-    logger.info("Polling info for chat=%s number=%s", chat_id, number)
+    logger.info("Polling API for chat=%s number=%s", chat_id, number)
     num_digits = digits_only(number)
 
-    # build candidate dates: allocated date (if any), today, yesterday
+    # candidate dates
     dates_to_try = []
     allocated_at = entry.get("allocated_at")
     if allocated_at:
@@ -286,47 +296,46 @@ def polling_job(context: CallbackContext):
     dates_to_try.append(today.strftime("%Y-%m-%d"))
     dates_to_try.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
 
-    tried = set()
+    seen_dates = set()
     try:
         for date_str in dates_to_try:
-            if date_str in tried:
+            if date_str in seen_dates:
                 continue
-            tried.add(date_str)
-            for page in range(1, 6):
+            seen_dates.add(date_str)
+            for page in range(1, 7):  # check several pages
                 try:
-                    resp = fetch_info(date_str, page=page)
+                    j = fetch_info(date_str, page=page)
                 except Exception as e:
-                    logger.debug("fetch_info failed date=%s page=%d: %s", date_str, page, e)
+                    logger.debug("fetch_info error for %s page %d: %s", date_str, page, e)
                     continue
-                data = resp.get("data")
+                data = j.get("data")
                 if not data:
                     continue
                 entries = data if isinstance(data, list) else [data]
                 for e in entries:
-                    # check explicit number/copy fields first
-                    e_number = e.get("number") or e.get("full_number") or e.get("copy") or ""
-                    e_number_digits = digits_only(e_number)
-                    message_text = extract_message_text(e) or ""
+                    # flatten entry and check for number presence
                     flattened = flatten_values(e)
                     flattened_digits = digits_only(flattened)
-
+                    # check dedicated fields if present
+                    e_number = (e.get("number") or e.get("full_number") or e.get("copy") or "")
+                    e_number_digits = digits_only(e_number)
                     matched = False
-                    if num_digits and (num_digits == e_number_digits or num_digits in e_number_digits or num_digits in flattened_digits):
-                        matched = True
-
-                    if not matched:
-                        # also check if the API exposes a 'copy' or 'number' inside nested data
-                        if num_digits and (num_digits in digits_only(str(e.get("copy", ""))) or num_digits in digits_only(str(e.get("full_number", "")))):
+                    if num_digits:
+                        if num_digits == e_number_digits or num_digits in e_number_digits or num_digits in flattened_digits:
                             matched = True
-
+                    if not matched:
+                        # also check variants with or without leading zero/plus
+                        alt = num_digits.lstrip("0")
+                        if alt and (alt in flattened_digits):
+                            matched = True
                     if not matched:
                         continue
 
-                    # At this point we believe this entry matches the allocated number
-                    logger.info("Found matching entry for chat=%s date=%s page=%d", chat_id, date_str, page)
+                    # matched entry; extract message & otp
+                    message_text = extract_message_text(e) or flattened
                     otp = extract_otp_from_text(message_text) or extract_otp_from_text(flattened)
                     status_field = (e.get("status") or "") or ""
-                    # If OTP found and not already recorded, forward
+                    # If OTP found and not already recorded, forward to user + group
                     if otp and not entry.get("otp"):
                         entry["otp"] = otp
                         entry["status"] = "success"
@@ -334,28 +343,36 @@ def polling_job(context: CallbackContext):
                         pretty_number = format_pretty_number(number)
                         tnow = datetime.now().strftime("%I:%M %p")
                         sms_text = html.escape(message_text or flattened)
-                        # send full message card
+                        # Build card text
+                        card = MSG_OTP_CARD.format(
+                            otp=html.escape(str(otp)),
+                            pretty_number=pretty_number,
+                            country=entry.get("country", "Unknown"),
+                            time=tnow,
+                            sms_text=sms_text
+                        )
+                        # send to user
                         try:
-                            context.bot.send_message(
-                                chat_id=chat_id,
-                                text=MSG_OTP_CARD.format(
-                                    otp=html.escape(otp),
-                                    pretty_number=pretty_number,
-                                    country=entry.get("country", "Unknown"),
-                                    time=tnow,
-                                    sms_text=sms_text
-                                ),
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=make_inline_buttons_for_otp(otp)
-                            )
-                            # Also send a plain message with raw message so user can long-press and copy easily
+                            context.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
+                            # also send raw/plain message to allow easy copy
                             if message_text:
-                                context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
-                            # concise OTP
-                            context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(otp)}</code>", parse_mode=ParseMode.HTML)
+                                try:
+                                    context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
+                                except Exception:
+                                    pass
+                            context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
                         except Exception as send_err:
-                            logger.warning("Failed to send OTP messages to chat %s: %s", chat_id, send_err)
-                        # stop job
+                            logger.warning("Failed to send OTP to user %s: %s", chat_id, send_err)
+                        # forward same to group if configured
+                        try:
+                            # send same card to forward chat
+                            context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
+                            if message_text:
+                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
+                            context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
+                        except Exception as fg_err:
+                            logger.warning("Failed to forward OTP to group %s: %s", FORWARD_CHAT_ID, fg_err)
+                        # remove job
                         job_obj = jobs_registry.pop(str(chat_id), None)
                         if job_obj:
                             try:
@@ -364,9 +381,9 @@ def polling_job(context: CallbackContext):
                                 pass
                         return
 
-                    # If provider marked failed/expired, mark locally and notify
-                    lower_text = (message_text + " " + flattened).lower()
-                    if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in lower_text or "expired" in lower_text:
+                    # provider-marked expired/failed
+                    combined = (message_text + " " + flattened).lower()
+                    if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
                         entry["status"] = "expired"
                         save_state()
                         pretty_number = format_pretty_number(number)
@@ -469,15 +486,13 @@ def callback_query_handler(update: Update, context: CallbackContext):
     data = query.data or ""
     chat_id = query.message.chat.id
 
-    # copy number - show alert AND send a plain message for long-press copying
+    # copy number - show alert AND send plain message for long-press copying
     if data.startswith("copy|"):
         _, number = data.split("|", 1)
         pretty = format_pretty_number(number)
-        text_for_alert = f"{pretty}"
         try:
-            query.answer(text=text_for_alert, show_alert=True)
+            query.answer(text=pretty, show_alert=True)
         except Exception:
-            # fallback: edit or send message
             pass
         try:
             context.bot.send_message(chat_id=chat_id, text=f"Number (tap & hold to copy):\n{pretty}")
@@ -500,7 +515,6 @@ def callback_query_handler(update: Update, context: CallbackContext):
             pass
         return
 
-    # acknowledge other callbacks
     try:
         query.answer()
     except Exception:
