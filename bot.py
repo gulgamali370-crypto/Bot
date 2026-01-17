@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
 """
-Dr OTP Receiver Bot - Robust OTP polling & forwarding
+Async Telegram OTP Receiver using python-telegram-bot v20 + aiohttp
 
-Goals:
-- Validate token and clear webhook at startup to avoid getUpdates conflicts.
-- Allocate numbers via MNIT API, store digit-normalized values and trailing-digit variants.
-- Poll MNIT /info endpoint aggressively (multiple dates/pages/status options).
-- Match API entries by checking known fields and trailing-digit variants (robust vs formatting).
-- Extract full message text + OTP using multiple heuristics and forward to user + forwarding chat.
-- Provide reliable "copy" UX: CallbackQuery.answer(show_alert=True) and plain message for long-press copying.
-- Resilient to network errors with retries/backoff; clear logs for debugging.
-
-Notes:
-- Do not paste BOT_TOKEN or MNIT_API_KEY in chat. Revoke any token you previously posted.
-- Set FORWARD_CHAT_ID env var to desired group/chat ID (defaults to -1003379113224).
-- No extra pip modules required beyond requirements.txt below.
+- Uses aiohttp for MNIT API (async HTTP).
+- Uses asyncio tasks per chat to poll /info until OTP found or expired.
+- Forwards OTP + full message to user and forwarding group (FORWARD_CHAT_ID).
+- Copy buttons use show_alert and a plain message for long-press copy.
+- Validates BOT_TOKEN on startup.
+- State persisted to state.json.
 """
 from __future__ import annotations
 
 import os
 import re
 import json
-import time
+import asyncio
 import logging
 import html
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
-import sys
 
-import requests
+import aiohttp
 from telegram import (
-    Bot,
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -38,17 +29,16 @@ from telegram import (
     ParseMode,
 )
 from telegram.ext import (
-    Updater,
+    ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
-    CallbackContext,
     CallbackQueryHandler,
     MessageHandler,
-    Filters,
+    filters,
 )
-from telegram.error import Unauthorized, NetworkError, Conflict
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8338765935:AAFn0hd_PWKVBfNXwj3pW9fLOVOhkJBndLc").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8338765935:AAHnYQZjI7vlPf26RkaXnioKenEMp7RauPU").strip()
 MNIT_API_KEY = os.getenv("MNIT_API_KEY", "M_WH9Q3U88V").strip()
 FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 
@@ -59,7 +49,6 @@ HEADERS = {"Content-Type": "application/json", "mapikey": MNIT_API_KEY}
 STATE_FILE = "state.json"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))  # seconds
 
-# ---------- UI & templates ----------
 CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 BUTTON_LABELS = {
@@ -82,18 +71,17 @@ MAIN_MENU_KEYS = [
     ["📞 Support"],
 ]
 
-# ---------- Logging ----------
 logging.basicConfig(format="[%(asctime)s] %(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------- In-memory state ----------
-# state: chat_id_str -> { range, number, digits, last_variants, country, allocated_at, status, otp }
+# structure: { chat_id_str: { range, number, digits, last_variants, country, allocated_at, status, otp } }
 state: Dict[str, Dict[str, Any]] = {}
-jobs_registry: Dict[str, Any] = {}
+tasks: Dict[str, asyncio.Task] = {}  # chat_id_str -> asyncio.Task
 
 
 # ---------- Persistence ----------
-def load_state() -> None:
+def load_state():
     global state
     try:
         if os.path.exists(STATE_FILE):
@@ -104,7 +92,7 @@ def load_state() -> None:
         logger.warning("Failed to load state.json: %s", e)
 
 
-def save_state() -> None:
+def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -132,65 +120,31 @@ def last_n_variants(s: str, lengths: Optional[List[int]] = None) -> List[str]:
 
 def flatten_values(x: Any) -> str:
     if isinstance(x, dict):
-        parts: List[str] = []
-        for v in x.values():
-            parts.append(flatten_values(v))
-        return " ".join([p for p in parts if p])
+        return " ".join(flatten_values(v) for v in x.values())
     if isinstance(x, list):
         return " ".join(flatten_values(i) for i in x)
     return str(x)
 
 
 def extract_message_text(entry: Dict[str, Any]) -> str:
-    # common keys
-    for k in ("message", "sms", "msg", "text", "body", "sms_text", "content", "raw"):
+    for k in ("message", "sms", "msg", "text", "body", "sms_text", "content"):
         v = entry.get(k)
         if v:
             return flatten_values(v)
-    # deep search heuristics for likely fields
-    def search(obj):
-        if isinstance(obj, dict):
-            for kk, vv in obj.items():
-                if isinstance(vv, (str, int, float)) and kk.lower() in (
-                    "message",
-                    "sms",
-                    "msg",
-                    "text",
-                    "body",
-                    "content",
-                    "description",
-                ):
-                    return str(vv)
-                res = search(vv)
-                if res:
-                    return res
-        if isinstance(obj, list):
-            for i in obj:
-                res = search(i)
-                if res:
-                    return res
-        return ""
-    nested = search(entry)
-    if nested:
-        return nested
-    # fallback: flattened full entry
+    # fallback
     return flatten_values(entry)
 
 
 def extract_otp_from_text(text: str) -> Optional[str]:
     if not text:
         return None
-    # normalize separators
     txt = re.sub(r"[|:]+", " ", text)
-    # simple numeric OTP
     m = re.search(r"\b(\d{4,8})\b", txt)
     if m:
         return m.group(1)
-    # alphanumeric patterns with separator
     m2 = re.search(r"\b([A-Z0-9]{1,6}[-_]\d{3,8})\b", txt, flags=re.IGNORECASE)
     if m2:
         return m2.group(1)
-    # patterns like <#> 123456
     m3 = re.search(r"[<#>]{1,3}\s*([0-9]{4,8})\b", txt)
     if m3:
         return m3.group(1)
@@ -206,7 +160,7 @@ def format_pretty_number(number: str) -> str:
         plus = "+"
         s = s[1:]
     digits = re.sub(r"\D", "", s)
-    groups: List[str] = []
+    groups = []
     while digits:
         groups.insert(0, digits[-3:])
         digits = digits[:-3]
@@ -214,38 +168,11 @@ def format_pretty_number(number: str) -> str:
     return f"{plus}{pretty}"
 
 
-# ---------- MNIT API helpers ----------
-def allocate_number(range_str: str, timeout: int = 30) -> Dict[str, Any]:
-    payload = {"range": range_str, "is_national": None, "remove_plus": None}
-    logger.info("Requesting allocation for range=%s", range_str)
-    resp = requests.post(ALLOCATE_URL, json=payload, headers=HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_info(date_str: str, page: int = 1, status: Optional[str] = None) -> Dict[str, Any]:
-    params = {"date": date_str, "page": page, "search": ""}
-    if status:
-        params["status"] = status
-    resp = requests.get(INFO_URL, headers=HEADERS, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-# ---------- Keyboards ----------
 def make_inline_buttons(number: str) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(BUTTON_LABELS["copy"], callback_data=f"copy|{number}")],
         [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
         [InlineKeyboardButton(BUTTON_LABELS["cancel"], callback_data=f"cancel|{number}")],
-        [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-
-def make_inline_buttons_after_timeout() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
         [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -260,205 +187,230 @@ def make_inline_buttons_for_otp(otp: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-# ---------- Polling job ----------
-def polling_job(context: CallbackContext) -> None:
-    job_ctx = context.job.context
-    chat_id = job_ctx["chat_id"]
-    entry = state.get(str(chat_id))
+# ---------- MNIT API (async) ----------
+async def allocate_number_async(range_str: str, session: aiohttp.ClientSession, timeout: int = 30) -> Dict[str, Any]:
+    payload = {"range": range_str, "is_national": None, "remove_plus": None}
+    logger.info("Requesting allocation for range=%s", range_str)
+    async with session.post(ALLOCATE_URL, json=payload, headers=HEADERS, timeout=timeout) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def fetch_info_async(date_str: str, session: aiohttp.ClientSession, page: int = 1, status: Optional[str] = None) -> Dict[str, Any]:
+    params = {"date": date_str, "page": page, "search": ""}
+    if status:
+        params["status"] = status
+    async with session.get(INFO_URL, headers=HEADERS, params=params, timeout=30) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+# ---------- Polling Task ----------
+async def polling_task(chat_id: int, app):
+    cid = str(chat_id)
+    entry = state.get(cid)
     if not entry:
         return
     number = entry.get("number")
     if not number:
         return
 
-    last_variants: List[str] = entry.get("last_variants") or last_n_variants(entry.get("digits") or digits_only(number))
-    logger.info("Polling chat=%s number=%s variants=%s", chat_id, number, last_variants)
+    last_variants = entry.get("last_variants") or last_n_variants(entry.get("digits") or digits_only(number))
+    logger.info("Started polling for chat=%s number=%s variants=%s", cid, number, last_variants)
 
-    # dates: allocated date, today, yesterday
-    dates: List[str] = []
-    allocated_at = entry.get("allocated_at")
-    if allocated_at:
+    async with aiohttp.ClientSession() as session:
         try:
-            dt = datetime.fromtimestamp(int(allocated_at), tz=timezone.utc)
-            dates.append(dt.strftime("%Y-%m-%d"))
-        except Exception:
-            pass
-    today = datetime.now(timezone.utc)
-    dates.append(today.strftime("%Y-%m-%d"))
-    dates.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
+            # dates to try: allocated date, today, yesterday
+            dates = []
+            allocated_at = entry.get("allocated_at")
+            if allocated_at:
+                try:
+                    dt = datetime.fromtimestamp(int(allocated_at), tz=timezone.utc)
+                    dates.append(dt.strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+            today = datetime.now(timezone.utc)
+            dates.append(today.strftime("%Y-%m-%d"))
+            dates.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
 
-    try:
-        for date_str in dates:
-            # try both with and without 'status' to increase hit-rate
-            for status in (None, "success"):
-                for page in range(1, 6):
-                    try:
-                        resp = fetch_info(date_str, page=page, status=status)
-                    except Exception as e:
-                        logger.debug("fetch_info failed date=%s page=%d status=%s error=%s", date_str, page, status, e)
-                        continue
-                    data = resp.get("data")
-                    if not data:
-                        continue
-                    entries = data if isinstance(data, list) else [data]
-                    for api_entry in entries:
-                        flat = flatten_values(api_entry)
-                        # Build search candidates (fields that typically contain the number)
-                        candidates: List[str] = []
-                        for fld in ("number", "full_number", "copy"):
-                            v = api_entry.get(fld)
-                            if v:
-                                candidates.append(str(v))
-                        candidates.append(flat)
-                        matched = False
-                        for cf in candidates:
-                            cf_digits = digits_only(cf)
-                            for v in last_variants:
-                                if v and v in cf_digits:
-                                    matched = True
-                                    break
-                            if matched:
-                                break
-                        if not matched:
-                            continue
-
-                        # matched -> extract message & OTP
-                        message_text = extract_message_text(api_entry) or flat
-                        otp = extract_otp_from_text(message_text) or extract_otp_from_text(flat)
-                        status_field = (api_entry.get("status") or "") or ""
-                        logger.info("Matched API entry for chat=%s date=%s page=%d status=%s otp_found=%s", chat_id, date_str, page, status_field, bool(otp))
-
-                        if otp and not entry.get("otp"):
-                            entry["otp"] = otp
-                            entry["status"] = "success"
-                            save_state()
-                            pretty = format_pretty_number(number)
-                            tnow = datetime.now().strftime("%I:%M %p")
-                            sms_text = html.escape(message_text or flat)
-                            card = (
-                                f"{CARD_SEPARATOR}\n"
-                                f"🔔 OTP Received\n"
-                                f"{CARD_SEPARATOR}\n"
-                                f"📩 Code: <code>{html.escape(str(otp))}</code>\n"
-                                f"📞 Number: {pretty}\n"
-                                f"🗺 Country: {entry.get('country','Unknown')}\n"
-                                f"⏰ Time: {tnow}\n"
-                                f"{CARD_SEPARATOR}\n"
-                                f"⚠️ Do not share this code\n"
-                                f"{CARD_SEPARATOR}\n"
-                                f"Message:\n"
-                                f"{sms_text}"
-                            )
-                            # send to user
+            while True:
+                # re-fetch entry in case updated
+                entry = state.get(cid)
+                if not entry:
+                    break
+                number = entry.get("number")
+                if not number:
+                    break
+                last_variants = entry.get("last_variants") or last_n_variants(entry.get("digits") or digits_only(number))
+                for date_str in dates:
+                    for status in (None, "success"):
+                        for page in range(1, 6):
                             try:
-                                context.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
-                                if message_text:
-                                    context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
-                                context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
-                            except Exception as se:
-                                logger.warning("Failed to send OTP to user %s: %s", chat_id, se)
-                            # forward to group
-                            try:
-                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
-                                if message_text:
-                                    context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
-                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
-                            except Exception as fg:
-                                logger.warning("Failed to forward OTP to group %s: %s", FORWARD_CHAT_ID, fg)
-                            # stop job
-                            job_obj = jobs_registry.pop(str(chat_id), None)
-                            if job_obj:
-                                try:
-                                    job_obj.schedule_removal()
-                                except Exception:
-                                    pass
-                            return
+                                resp = await fetch_info_async(date_str, session, page=page, status=status)
+                            except Exception as e:
+                                logger.debug("fetch_info error date=%s page=%d status=%s: %s", date_str, page, status, e)
+                                continue
+                            data = resp.get("data")
+                            if not data:
+                                continue
+                            entries = data if isinstance(data, list) else [data]
+                            for api_entry in entries:
+                                flat = flatten_values(api_entry)
+                                candidates = []
+                                for fld in ("number", "full_number", "copy"):
+                                    v = api_entry.get(fld)
+                                    if v:
+                                        candidates.append(str(v))
+                                candidates.append(flat)
+                                matched = False
+                                for cf in candidates:
+                                    cf_digits = digits_only(cf)
+                                    for v in last_variants:
+                                        if v and v in cf_digits:
+                                            matched = True
+                                            break
+                                    if matched:
+                                        break
+                                if not matched:
+                                    continue
 
-                        # handle provider-marked expired/failed
-                        combined = (message_text + " " + flat).lower()
-                        if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
-                            entry["status"] = "expired"
-                            save_state()
-                            pretty = format_pretty_number(number)
-                            try:
-                                context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(sep=CARD_SEPARATOR, pretty_number=pretty), reply_markup=make_inline_buttons_after_timeout())
-                            except Exception:
-                                pass
-                            job_obj = jobs_registry.pop(str(chat_id), None)
-                            if job_obj:
-                                try:
-                                    job_obj.schedule_removal()
-                                except Exception:
-                                    pass
-                            return
-        logger.debug("No match for chat=%s number=%s (yet)", chat_id, number)
-    except Exception as e:
-        logger.warning("Polling job error for chat %s: %s", chat_id, e)
+                                message_text = extract_message_text(api_entry) or flat
+                                otp = extract_otp_from_text(message_text) or extract_otp_from_text(flat)
+                                status_field = (api_entry.get("status") or "") or ""
+                                logger.info("Matched entry for chat=%s date=%s page=%d status=%s otp=%s", cid, date_str, page, status_field, bool(otp))
+
+                                if otp and not entry.get("otp"):
+                                    entry["otp"] = otp
+                                    entry["status"] = "success"
+                                    save_state()
+                                    pretty = format_pretty_number(number)
+                                    tnow = datetime.now().strftime("%I:%M %p")
+                                    sms_text = html.escape(message_text or flat)
+                                    card = (
+                                        f"{CARD_SEPARATOR}\n"
+                                        f"🔔 OTP Received\n"
+                                        f"{CARD_SEPARATOR}\n"
+                                        f"📩 Code: <code>{html.escape(str(otp))}</code>\n"
+                                        f"📞 Number: {pretty}\n"
+                                        f"🗺 Country: {entry.get('country','Unknown')}\n"
+                                        f"⏰ Time: {tnow}\n"
+                                        f"{CARD_SEPARATOR}\n"
+                                        f"⚠️ Do not share this code\n"
+                                        f"{CARD_SEPARATOR}\n"
+                                        f"Message:\n"
+                                        f"{sms_text}"
+                                    )
+                                    # send to user
+                                    try:
+                                        await app.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
+                                        if message_text:
+                                            await app.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
+                                        await app.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
+                                    except Exception as se:
+                                        logger.warning("Failed to send OTP to user %s: %s", chat_id, se)
+                                    # forward to group
+                                    try:
+                                        await app.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
+                                        if message_text:
+                                            await app.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
+                                        await app.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
+                                    except Exception as fg:
+                                        logger.warning("Failed to forward OTP to group %s: %s", FORWARD_CHAT_ID, fg)
+                                    # cancel task and return
+                                    t = tasks.pop(cid, None)
+                                    if t:
+                                        try:
+                                            t.cancel()
+                                        except Exception:
+                                            pass
+                                    return
+
+                                # expired/failed checks
+                                combined = (message_text + " " + flat).lower()
+                                if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
+                                    entry["status"] = "expired"
+                                    save_state()
+                                    pretty = format_pretty_number(number)
+                                    try:
+                                        await app.bot.send_message(chat_id=chat_id, text=f"{CARD_SEPARATOR}\n❌ OTP Expired\n{CARD_SEPARATOR}\n{pretty}\n\nThis number has been marked Expired by the provider.\nYou can request a new one.", reply_markup=make_inline_buttons_after_timeout())
+                                    except Exception:
+                                        pass
+                                    t = tasks.pop(cid, None)
+                                    if t:
+                                        try:
+                                            t.cancel()
+                                        except Exception:
+                                            pass
+                                    return
+                await asyncio.sleep(POLL_INTERVAL)
+        except asyncio.CancelledError:
+            logger.info("Polling task cancelled for chat=%s", cid)
+            return
+        except Exception as e:
+            logger.warning("Polling job error for chat %s: %s", cid, e)
+            # retry after sleep
+            await asyncio.sleep(POLL_INTERVAL)
+
+
+def make_inline_buttons_after_timeout() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
+        [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 
 # ---------- Handlers ----------
-def start(update: Update, context: CallbackContext) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
-        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
+        await update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
     except Exception:
-        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER)
+        await update.message.reply_text("👋 Welcome!\n" + MSG_HELPER)
 
 
-def status_cmd(update: Update, context: CallbackContext) -> None:
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ent = state.get(str(chat_id))
     if not ent:
-        update.message.reply_text("No active number. Use /range to get one.\n\n" + MSG_HELPER)
+        await update.message.reply_text("No active number. Use /range to get one.\n\n" + MSG_HELPER)
         return
     number = ent.get("number")
-    st = ent.get("status", "pending")
+    status = ent.get("status", "pending")
     otp = ent.get("otp")
-    pretty_number = format_pretty_number(number)
+    pretty = format_pretty_number(number)
     status_map = {"pending": "⏳ Waiting for OTP…", "success": "✅ OTP Received", "expired": "❌ Expired"}
-    friendly = status_map.get(st, st.capitalize())
-    card_text = (
-        f"{CARD_SEPARATOR}\n"
-        f"📱 Country: {ent.get('country','Unknown')}\n"
-        f"📞 Phone: {pretty_number}\n"
-        f"🔢 Range: {ent.get('range')}\n"
-        f"{CARD_SEPARATOR}\n"
-        f"Status: {friendly}"
-    )
+    friendly = status_map.get(status, status.capitalize())
+    card = f"{CARD_SEPARATOR}\n📱 Country: {ent.get('country','Unknown')}\n📞 Phone: {pretty}\n🔢 Range: {ent.get('range')}\n{CARD_SEPARATOR}\nStatus: {friendly}"
     if otp:
-        card_text += f"\n\n🔐 OTP: <code>{html.escape(str(otp))}</code>"
-    update.message.reply_text(card_text, reply_markup=make_inline_buttons(number), parse_mode=ParseMode.HTML)
+        card += f"\n\n🔐 OTP: <code>{html.escape(str(otp))}</code>"
+    await update.message.reply_text(card, reply_markup=make_inline_buttons(number), parse_mode=ParseMode.HTML)
 
 
-def range_handler(update: Update, context: CallbackContext) -> None:
+async def range_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not context.args:
-        update.message.reply_text("Send range: /range 261347435XXX or /range 261347435123\n\n" + MSG_HELPER)
+        await update.message.reply_text("Send range: /range 261347435XXX or /range 261347435123\n\n" + MSG_HELPER)
         return
     raw = " ".join(context.args).strip()
-    rng = raw
-    if "XXX" not in rng:
-        digits = digits_only(rng)
-        rng = (digits[:-3] + "XXX") if len(digits) > 3 else (digits + "XXX")
-    msg = update.message.reply_text("Getting number — please wait...")
-    try:
-        alloc = allocate_number(rng)
-    except Exception as e:
-        msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{e}")
-        return
-
+    rng = raw if "XXX" in raw else (digits_only(raw)[:-3] + "XXX" if len(digits_only(raw)) > 3 else digits_only(raw) + "XXX")
+    msg = await update.message.reply_text("Getting number — please wait...")
+    async with aiohttp.ClientSession() as session:
+        try:
+            alloc = await allocate_number_async(rng, session)
+        except Exception as e:
+            await msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{e}")
+            return
     meta = alloc.get("meta", {})
     if meta.get("code") != 200:
-        msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
+        await msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
         return
-
     data = alloc.get("data", {}) or {}
     full_number = data.get("full_number") or data.get("number") or data.get("copy")
     country = data.get("country") or data.get("iso") or "Unknown"
     if not full_number:
-        msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
+        await msg.edit_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
         return
-
     digits = digits_only(full_number)
     last_variants = last_n_variants(digits)
     state[str(chat_id)] = {
@@ -472,70 +424,71 @@ def range_handler(update: Update, context: CallbackContext) -> None:
         "otp": None,
     }
     save_state()
+    pretty = format_pretty_number(full_number)
+    await msg.edit_text(f"{CARD_SEPARATOR}\n📱 Country: {country}\n📞 Phone: {pretty}\n🔢 Range: {rng}\n{CARD_SEPARATOR}\n⏳ Status: Waiting for OTP", reply_markup=make_inline_buttons(full_number))
+    # start polling
+    cid = str(chat_id)
+    if cid in tasks:
+        logger.info("Polling task already exists for chat %s", cid)
+    else:
+        app = context.application
+        t = asyncio.create_task(polling_task(chat_id, app))
+        tasks[cid] = t
 
-    pretty_number = format_pretty_number(full_number)
-    msg.edit_text(MSG_ALLOCATION_CARD.format(sep=CARD_SEPARATOR, country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
 
-    # start polling job
-    if str(chat_id) not in jobs_registry:
-        job = context.job_queue.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": chat_id})
-        jobs_registry[str(chat_id)] = job
-
-
-def callback_query_handler(update: Update, context: CallbackContext) -> None:
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
     chat_id = query.message.chat.id
 
-    # copy number
     if data.startswith("copy|"):
         _, number = data.split("|", 1)
         pretty = format_pretty_number(number)
         try:
-            query.answer(text=pretty, show_alert=True)
+            await query.answer(text=pretty, show_alert=True)
         except Exception:
             pass
         try:
-            context.bot.send_message(chat_id=chat_id, text=f"Number (tap & hold to copy):\n{pretty}")
-            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+            await context.bot.send_message(chat_id=chat_id, text=f"Number (tap & hold to copy):\n{pretty}")
+            await context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
         except Exception:
             pass
         return
 
-    # copy otp
     if data.startswith("copyotp|"):
         _, otp = data.split("|", 1)
         try:
-            query.answer(text=otp, show_alert=True)
+            await query.answer(text=otp, show_alert=True)
         except Exception:
             pass
         try:
-            context.bot.send_message(chat_id=chat_id, text=f"OTP (tap & hold to copy):\n{otp}")
-            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+            await context.bot.send_message(chat_id=chat_id, text=f"OTP (tap & hold to copy):\n{otp}")
+            await context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
         except Exception:
             pass
         return
 
     try:
-        query.answer()
+        await query.answer()
     except Exception:
         pass
 
     if data == "change":
         ent = state.get(str(chat_id))
         if not ent:
-            query.edit_message_text("No active allocation. Use /range to get a number.")
+            await query.edit_message_text("No active allocation. Use /range to get a number.")
             return
         rng = ent.get("range")
-        query.edit_message_text("🔁 Requesting a new number — please wait...")
-        try:
-            alloc = allocate_number(rng)
-        except Exception as e:
-            query.edit_message_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{e}")
-            return
+        await query.edit_message_text("🔁 Requesting a new number — please wait...")
+        async with aiohttp.ClientSession() as session:
+            try:
+                alloc = await allocate_number_async(rng, session)
+            except Exception as e:
+                await query.edit_message_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{e}")
+                return
         meta = alloc.get("meta", {})
         if meta.get("code") != 200:
-            query.edit_message_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
+            await query.edit_message_text(f"{CARD_SEPARATOR}\n⚠️ Allocation Failed\n{CARD_SEPARATOR}\n{alloc}")
             return
         data = alloc.get("data", {}) or {}
         full_number = data.get("full_number") or data.get("number") or data.get("copy")
@@ -554,7 +507,12 @@ def callback_query_handler(update: Update, context: CallbackContext) -> None:
         }
         save_state()
         pretty = format_pretty_number(full_number)
-        query.edit_message_text(MSG_ALLOCATION_CARD.format(sep=CARD_SEPARATOR, country=country, pretty_number=pretty, range=rng), reply_markup=make_inline_buttons(full_number))
+        await query.edit_message_text(f"{CARD_SEPARATOR}\n📱 Country: {country}\n📞 Phone: {pretty}\n🔢 Range: {rng}\n{CARD_SEPARATOR}\n⏳ Status: Waiting for OTP", reply_markup=make_inline_buttons(full_number))
+        # start polling if not present
+        cid = str(chat_id)
+        if cid not in tasks:
+            t = asyncio.create_task(polling_task(chat_id, context.application))
+            tasks[cid] = t
         return
 
     if data.startswith("cancel|"):
@@ -567,39 +525,27 @@ def callback_query_handler(update: Update, context: CallbackContext) -> None:
             ent["status"] = "expired"
             save_state()
             pretty = format_pretty_number(number or ent.get("number"))
-            query.edit_message_text(MSG_EXPIRED.format(sep=CARD_SEPARATOR, pretty_number=pretty), reply_markup=make_inline_buttons_after_timeout())
-            job_obj = jobs_registry.pop(str(chat_id), None)
-            if job_obj:
+            await query.edit_message_text(f"{CARD_SEPARATOR}\n❌ OTP Expired\n{CARD_SEPARATOR}\n{pretty}\n\nThis number has been marked Expired by the provider.\nYou can request a new one.", reply_markup=make_inline_buttons_after_timeout())
+            t = tasks.pop(str(chat_id), None)
+            if t:
                 try:
-                    job_obj.schedule_removal()
+                    t.cancel()
                 except Exception:
                     pass
             return
-        query.edit_message_text("No matching active number to cancel.")
+        await query.edit_message_text("No matching active number to cancel.")
         return
 
     if data == "back":
-        query.edit_message_text("⬅ Back to Menu\nUse /range to allocate or /status to view current number.")
+        await query.edit_message_text("⬅ Back to Menu\nUse /range to allocate or /status to view current number.")
         return
 
 
-def make_inline_buttons_after_timeout() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
-        [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-
-def unknown(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("Unknown command. Use /start, /range <range>, /status")
-
-
-def history_command(update: Update, context: CallbackContext) -> None:
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ent = state.get(str(chat_id))
     if not ent:
-        update.message.reply_text(f"{CARD_SEPARATOR}\n📜 History\n{CARD_SEPARATOR}\nNo history available yet.")
+        await update.message.reply_text(f"{CARD_SEPARATOR}\n📜 History\n{CARD_SEPARATOR}\nNo history available yet.")
         return
     pretty = format_pretty_number(ent.get("number"))
     allocated_time = datetime.fromtimestamp(ent.get("allocated_at")).strftime("%Y-%m-%d %H:%M:%S")
@@ -614,107 +560,66 @@ def history_command(update: Update, context: CallbackContext) -> None:
         f"{otp_line}\n"
         f"{CARD_SEPARATOR}"
     )
-    update.message.reply_text(history_text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(history_text, parse_mode=ParseMode.HTML)
 
 
-def on_startup_jobs_updater(updater: Updater) -> None:
-    jq = updater.job_queue
-    for chat_id, ent in state.items():
-        if ent.get("number") and ent.get("status") != "expired" and not ent.get("otp"):
-            try:
-                job = jq.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": int(chat_id)})
-                jobs_registry[chat_id] = job
-                logger.info("Restarted polling job for chat %s", chat_id)
-            except Exception as e:
-                logger.warning("Could not restart job for %s: %s", chat_id, e)
-
-
-# ---------- Startup/main ----------
-def main() -> None:
+# ---------- Startup ----------
+async def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set. Set BOT_TOKEN environment variable.")
-        sys.exit(1)
+        logger.error("BOT_TOKEN not set. Set BOT_TOKEN env var.")
+        return
     if not MNIT_API_KEY:
-        logger.error("MNIT_API_KEY not set. Set MNIT_API_KEY environment variable.")
-        sys.exit(1)
+        logger.error("MNIT_API_KEY not set. Set MNIT_API_KEY env var.")
+        return
 
     load_state()
 
-    # Validate token with small retry/backoff for transient network errors
-    max_retries = 4
-    backoff = 1
-    bot: Optional[Bot] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            bot = Bot(BOT_TOKEN)
-            me = bot.get_me()
-            logger.info("Bot validated: %s (id=%s)", getattr(me, "username", ""), getattr(me, "id", ""))
-            try:
-                bot.delete_webhook()
-                logger.info("Deleted webhook (if any).")
-            except Exception:
-                logger.debug("delete_webhook no-op.")
-            break
-        except Unauthorized:
-            logger.error("BOT_TOKEN invalid/unauthorized. Update token and restart.")
-            sys.exit(1)
-        except NetworkError as ne:
-            logger.warning("Network error validating token (attempt %d/%d): %s", attempt, max_retries, ne)
-            if attempt == max_retries:
-                logger.error("Network error persisted; exiting.")
-                sys.exit(1)
-            time.sleep(backoff)
-            backoff *= 2
-        except Exception as e:
-            logger.warning("Error validating bot token (attempt %d/%d): %s", attempt, max_retries, e)
-            if attempt == max_retries:
-                logger.error("Validation failed; exiting.")
-                sys.exit(1)
-            time.sleep(backoff)
-            backoff *= 2
-
-    updater = Updater(bot=bot, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("range", range_handler))
-    dp.add_handler(CommandHandler("status", status_cmd))
-    dp.add_handler(CommandHandler("history", history_command))
-    dp.add_handler(CallbackQueryHandler(callback_query_handler))
-    dp.add_handler(MessageHandler(Filters.command, unknown))
-
+    # Build application and validate token
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
     try:
-        updater.start_polling()
-    except Conflict:
-        logger.error("Conflict: another getUpdates process is running for this token.")
-        sys.exit(1)
-    except Unauthorized:
-        logger.error("Unauthorized when starting polling; check BOT_TOKEN.")
-        sys.exit(1)
+        me = await application.bot.get_me()
+        logger.info("Bot validated: %s (id=%s)", getattr(me, "username", ""), getattr(me, "id", ""))
+        # try to delete webhook to avoid conflicts
+        try:
+            await application.bot.delete_webhook()
+            logger.info("Deleted existing webhook (if any).")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("Failed validating BOT_TOKEN: %s", e)
+        return
 
-    on_startup_jobs_updater(updater)
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("range", range_handler))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
+    application.add_handler(MessageHandler(filters.COMMAND, lambda u, c: u.message.reply_text("Unknown command. Use /start, /range <range>, /status")))
+
+    # restart polling tasks for saved state
+    for chat_id_str, ent in list(state.items()):
+        if ent.get("number") and ent.get("status") != "expired" and not ent.get("otp"):
+            try:
+                t = asyncio.create_task(polling_task(int(chat_id_str), application))
+                tasks[chat_id_str] = t
+                logger.info("Restarted polling for chat %s", chat_id_str)
+            except Exception as e:
+                logger.warning("Could not restart polling for %s: %s", chat_id_str, e)
+
+    # Start
+    await application.initialize()
+    await application.start()
     logger.info("Bot started.")
-    updater.idle()
+    await application.updater.start_polling()
+    # keep running
+    await application.updater.idle()
+    await application.stop()
+    await application.shutdown()
 
-
-# module-level small templates used earlier (to avoid NameError)
-MSG_ALLOCATION_CARD = (
-    "{sep}\n"
-    "📱 Country: {country}\n"
-    "📞 Phone: {pretty_number}\n"
-    "🔢 Range: {range}\n"
-    "{sep}\n"
-    "⏳ Status: Waiting for OTP"
-)
-
-MSG_EXPIRED = (
-    "{sep}\n"
-    "❌ OTP Expired\n"
-    "{sep}\n"
-    "{pretty_number}\n\n"
-    "This number has been marked Expired by the provider.\n"
-    "You can request a new one."
-)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down.")
