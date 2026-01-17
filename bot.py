@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Robust Telegram OTP Receiver Bot
+Dr OTP Receiver Bot - Improved matching, expire-fix, and automatic range discovery
 
-Behavior summary:
-- Validates Telegram BOT_TOKEN but does NOT exit on Unauthorized/network errors.
-- If token missing/invalid it keeps running and retries validation periodically.
-- When a valid token is available it starts the Telegram Updater + handlers.
-- Polls MNIT info endpoint for messages and forwards OTP + full message to the user and to FORWARD_CHAT_ID.
-- Copy button shows an alert and also sends a plain message so mobile long-press copy works.
-- Saves state to state.json and restarts polling jobs on boot if allocations exist.
+Fixes:
+- Avoid false "Expired" by matching API entries strictly:
+  * Prefer explicit fields "number", "full_number", "copy" to match allocated number.
+  * Only use flattened entry as fallback when it clearly contains the full allocated number digits.
+  * Mark "expired" only when API entry's status explicitly contains 'expired'/'failed' or
+    when the matching API entry's message contains those keywords for the same number.
+- Added /discover command to scan recent MNIT /info pages and propose active ranges.
+  The bot extracts likely prefixes (first N digits) and suggests them as clickable ranges.
+- Adds callback action "use_range|{range}" so user can pick a discovered range quickly.
+- Keeps existing functionality: allocation, polling, OTP forwarding, copy UX, forwarding to group.
+- Robust to missing/invalid BOT_TOKEN (token watcher thread starts updater when valid).
 
 ENV:
-- BOT_TOKEN (recommended) - if absent/invalid the bot will keep running and retry.
-- MNIT_API_KEY (required to allocate and fetch info)
-- FORWARD_CHAT_ID (optional) - default -1003379113224
-- POLL_INTERVAL (optional seconds, default 10)
+- BOT_TOKEN (recommended)
+- MNIT_API_KEY (required)
+- FORWARD_CHAT_ID (optional) default: -1003379113224
+- POLL_INTERVAL (optional) default: 10
 
-Files to keep same: requirements.txt (provided), Procfile (provided).
-
+Deploy: replace bot.py, restart service. If OTP still not forwarded, provide one sample JSON response
+from the INFO endpoint so matching can be tuned.
 """
 from __future__ import annotations
 
@@ -132,6 +136,7 @@ logging.basicConfig(format="[%(asctime)s] %(levelname)s: %(message)s", level=log
 logger = logging.getLogger(__name__)
 
 # ---------- In-memory state ----------
+# state: chat_id_str -> { range, number, digits, last_variants, country, allocated_at, status, otp }
 state: Dict[str, Dict[str, Any]] = {}
 jobs_registry: Dict[str, Any] = {}
 
@@ -297,7 +302,55 @@ def make_inline_buttons_for_otp(otp: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-# ---------- Polling job ----------
+# ---------- Discover helper ----------
+def discover_ranges_from_info(pages: int = 5, dates: Optional[List[str]] = None) -> List[str]:
+    """
+    Scan recent /info pages and build a list of candidate ranges (prefixes).
+    Strategy: collect full numbers from API entries and return distinct prefixes of length 6 (or 7).
+    """
+    prefixes = {}
+    if dates is None:
+        today = datetime.now(timezone.utc)
+        dates = [today.strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")]
+    try:
+        for date_str in dates:
+            for page in range(1, pages + 1):
+                try:
+                    resp = fetch_info(date_str, page=page, status=None)
+                except Exception:
+                    # try with status=success as fallback
+                    try:
+                        resp = fetch_info(date_str, page=page, status="success")
+                    except Exception:
+                        continue
+                data = resp.get("data")
+                if not data:
+                    continue
+                entries = data if isinstance(data, list) else [data]
+                for e in entries:
+                    num = e.get("full_number") or e.get("number") or e.get("copy") or ""
+                    if not num:
+                        # try to extract digits from flattened text
+                        flat = flatten_values(e)
+                        d = digits_only(flat)
+                        if len(d) >= 6:
+                            num = d
+                    d = digits_only(num)
+                    if len(d) >= 6:
+                        # choose prefix length 6 or 7 based on length
+                        for L in (6, 7, 8):
+                            if len(d) > L:
+                                pref = d[:L]
+                                prefixes[pref] = prefixes.get(pref, 0) + 1
+                                break
+    except Exception as e:
+        logger.debug("discover_ranges error: %s", e)
+    # sort by frequency and return top candidates
+    sorted_prefs = sorted(prefixes.items(), key=lambda x: x[1], reverse=True)
+    return [p for p, _ in sorted_prefs[:10]]
+
+
+# ---------- Polling job (strict matching) ----------
 def polling_job(context: CallbackContext) -> None:
     job_ctx = context.job.context
     chat_id = job_ctx["chat_id"]
@@ -308,9 +361,11 @@ def polling_job(context: CallbackContext) -> None:
     if not number:
         return
 
-    last_variants: List[str] = entry.get("last_variants") or last_n_variants(entry.get("digits") or digits_only(number))
+    num_digits = entry.get("digits") or digits_only(number)
+    last_variants = entry.get("last_variants") or last_n_variants(num_digits)
     logger.info("Polling chat=%s number=%s variants=%s", chat_id, number, last_variants)
 
+    # dates to try
     dates: List[str] = []
     allocated_at = entry.get("allocated_at")
     if allocated_at:
@@ -337,29 +392,39 @@ def polling_job(context: CallbackContext) -> None:
                         continue
                     entries = data if isinstance(data, list) else [data]
                     for api_entry in entries:
-                        flat = flatten_values(api_entry)
-                        candidates: List[str] = []
-                        for fld in ("number", "full_number", "copy"):
-                            v = api_entry.get(fld)
-                            if v:
-                                candidates.append(str(v))
-                        candidates.append(flat)
+                        # Strict matching:
+                        # 1) Prefer explicit fields
+                        explicit_number = api_entry.get("full_number") or api_entry.get("number") or api_entry.get("copy")
+                        explicit_digits = digits_only(explicit_number) if explicit_number else ""
                         matched = False
-                        for cf in candidates:
-                            cf_digits = digits_only(cf)
-                            for v in last_variants:
-                                if v and v in cf_digits:
-                                    matched = True
-                                    break
-                            if matched:
-                                break
+                        if explicit_digits:
+                            # require the saved digits to be substring of explicit_digits (exact match)
+                            if num_digits and (num_digits == explicit_digits or num_digits in explicit_digits or explicit_digits in num_digits):
+                                matched = True
+                        if not matched:
+                            # 2) fallback: check flattened text but only if it contains the full allocated digits
+                            flat = flatten_values(api_entry)
+                            flat_digits = digits_only(flat)
+                            if num_digits and num_digits in flat_digits:
+                                matched = True
                         if not matched:
                             continue
 
-                        message_text = extract_message_text(api_entry) or flat
-                        otp = extract_otp_from_text(message_text) or extract_otp_from_text(flat)
+                        # Now we are confident this API entry refers to our number
+                        message_text = extract_message_text(api_entry) or flatten_values(api_entry)
+                        otp = extract_otp_from_text(message_text) or extract_otp_from_text(flatten_values(api_entry))
                         status_field = (api_entry.get("status") or "") or ""
-                        logger.info("Matched API entry for chat=%s date=%s page=%d status=%s otp_found=%s", chat_id, date_str, page, status_field, bool(otp))
+                        logger.info("Found matching info entry for chat=%s status=%s otp=%s", chat_id, status_field, bool(otp))
+
+                        # Only mark expired if explicit status indicates it or message explicitly mentions expired/failed for this number
+                        provider_says_expired = False
+                        if isinstance(status_field, str) and ("expired" in status_field.lower() or "failed" in status_field.lower()):
+                            provider_says_expired = True
+                        else:
+                            # check message text for clear indicators tied to this number
+                            low = (message_text or "").lower()
+                            if ("expired" in low or "failed" in low) and num_digits and num_digits in digits_only(message_text):
+                                provider_says_expired = True
 
                         if otp and not entry.get("otp"):
                             entry["otp"] = otp
@@ -367,11 +432,10 @@ def polling_job(context: CallbackContext) -> None:
                             save_state()
                             pretty = format_pretty_number(number)
                             tnow = datetime.now().strftime("%I:%M %p")
-                            sms_text = html.escape(message_text or flat)
+                            sms_text = html.escape(message_text or "")
                             card = MSG_OTP_CARD.format(sep=CARD_SEPARATOR, otp=html.escape(str(otp)), pretty_number=pretty, country=entry.get("country", "Unknown"), time=tnow, sms_text=sms_text)
                             # send to user
                             try:
-                                # safe: context.bot might be present only when Telegram started
                                 context.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
                                 if message_text:
                                     context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
@@ -380,7 +444,6 @@ def polling_job(context: CallbackContext) -> None:
                                 logger.warning("Failed to send OTP to user %s: %s", chat_id, se)
                             # forward to group
                             try:
-                                # If bot not available this will raise; keep logged
                                 context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
                                 if message_text:
                                     context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
@@ -396,8 +459,7 @@ def polling_job(context: CallbackContext) -> None:
                                     pass
                             return
 
-                        combined = (message_text + " " + flat).lower()
-                        if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
+                        if provider_says_expired:
                             entry["status"] = "expired"
                             save_state()
                             pretty = format_pretty_number(number)
@@ -412,7 +474,7 @@ def polling_job(context: CallbackContext) -> None:
                                 except Exception:
                                     pass
                             return
-        logger.debug("No match for chat=%s number=%s (yet)", chat_id, number)
+        # no match yet
     except Exception as e:
         logger.warning("Polling job error for chat %s: %s", chat_id, e)
 
@@ -456,8 +518,8 @@ def range_handler(update: Update, context: CallbackContext) -> None:
     if not context.args:
         update.message.reply_text("Send range: /range 261347435XXX or /range 261347435123\n\n" + MSG_HELPER)
         return
-    raw = " ".join(context.args).strip()
-    rng = raw
+    raw = " ".join(context.args)
+    rng = raw.strip()
     if "XXX" not in rng:
         digits = digits_only(rng)
         rng = (digits[:-3] + "XXX") if len(digits) > 3 else (digits + "XXX")
@@ -502,10 +564,78 @@ def range_handler(update: Update, context: CallbackContext) -> None:
         jobs_registry[str(chat_id)] = job
 
 
+def discover_handler(update: Update, context: CallbackContext) -> None:
+    """
+    /discover [optional-prefix]
+    Scans recent /info and suggests candidate ranges (prefixes) that appear active.
+    """
+    chat_id = update.effective_chat.id
+    arg = None
+    if context.args:
+        arg = context.args[0].strip()
+    update.message.reply_text("Scanning provider data for active prefixes — please wait...")
+    candidates = discover_ranges_from_info()
+    if arg:
+        # prioritize prefixes that start with arg digits
+        arg_digits = digits_only(arg)
+        candidates = [p for p in candidates if p.startswith(arg_digits)] + [p for p in candidates if not p.startswith(arg_digits)]
+    if not candidates:
+        update.message.reply_text("No candidate prefixes found. Try again later or provide a longer starting prefix.")
+        return
+    text = "Found candidate prefixes (tap to use as range):\n"
+    kb = []
+    for p in candidates[:8]:
+        rng = p + ("XXX" if len(p) < 10 else "XXX")
+        text += f"- {rng}\n"
+        kb.append([InlineKeyboardButton(f"Use {rng}", callback_data=f"use_range|{rng}")])
+    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
 def callback_query_handler(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     data = query.data or ""
     chat_id = query.message.chat.id
+
+    if data.startswith("use_range|"):
+        _, rng = data.split("|", 1)
+        rng = rng.strip()
+        query.answer()
+        query.edit_message_text(f"Using range {rng} — requesting number...")
+        # call allocation flow (reuse code)
+        try:
+            alloc = allocate_number(rng)
+        except Exception as e:
+            query.edit_message_text(MSG_ALLOCATION_ERROR.format(sep=CARD_SEPARATOR, short_error_message=str(e)))
+            return
+        meta = alloc.get("meta", {})
+        if meta.get("code") != 200:
+            query.edit_message_text(MSG_ALLOCATION_ERROR.format(sep=CARD_SEPARATOR, short_error_message=str(alloc)))
+            return
+        data = alloc.get("data", {}) or {}
+        full_number = data.get("full_number") or data.get("number") or data.get("copy")
+        country = data.get("country") or "Unknown"
+        if not full_number:
+            query.edit_message_text(MSG_ALLOCATION_ERROR.format(sep=CARD_SEPARATOR, short_error_message=str(alloc)))
+            return
+        digits = digits_only(full_number)
+        last_variants = last_n_variants(digits)
+        state[str(chat_id)] = {
+            "range": rng,
+            "number": full_number,
+            "digits": digits,
+            "last_variants": last_variants,
+            "country": country,
+            "allocated_at": int(time.time()),
+            "status": data.get("status", "pending"),
+            "otp": None,
+        }
+        save_state()
+        pretty_number = format_pretty_number(full_number)
+        query.edit_message_text(MSG_ALLOCATION_CARD.format(sep=CARD_SEPARATOR, country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
+        if str(chat_id) not in jobs_registry:
+            job = context.job_queue.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": chat_id})
+            jobs_registry[str(chat_id)] = job
+        return
 
     if data.startswith("copy|"):
         _, number = data.split("|", 1)
@@ -601,16 +731,12 @@ def callback_query_handler(update: Update, context: CallbackContext) -> None:
         return
 
 
-def make_inline_buttons_after_timeout() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(BUTTON_LABELS["change"], callback_data="change")],
-        [InlineKeyboardButton(BUTTON_LABELS["back"], callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(kb)
+def discover_callback_example_text() -> str:
+    return "Use /discover to scan provider data and suggest active prefixes (ranges)."
 
 
 def unknown(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("Unknown command. Use /start, /range <range>, /status")
+    update.message.reply_text("Unknown command. Use /start, /range <range>, /discover, /status")
 
 
 def history_command(update: Update, context: CallbackContext) -> None:
@@ -644,20 +770,20 @@ def start_telegram_updater(bot: Bot) -> None:
     global _updater_global
     with _updater_lock:
         if _updater_global:
-            return  # already started
+            return
         updater = Updater(bot=bot, use_context=True)
         dp = updater.dispatcher
         dp.add_handler(CommandHandler("start", start))
         dp.add_handler(CommandHandler("range", range_handler))
         dp.add_handler(CommandHandler("status", status_cmd))
         dp.add_handler(CommandHandler("history", history_command))
+        dp.add_handler(CommandHandler("discover", discover_handler))
         dp.add_handler(CallbackQueryHandler(callback_query_handler))
         dp.add_handler(MessageHandler(Filters.command, unknown))
         try:
             updater.start_polling()
             logger.info("Telegram updater started.")
             _updater_global = updater
-            # restart jobs for saved state
             on_startup_jobs_updater(updater)
         except Conflict:
             logger.error("Conflict: another getUpdates process is running for this token.")
@@ -666,14 +792,8 @@ def start_telegram_updater(bot: Bot) -> None:
 
 
 def token_watcher_loop() -> None:
-    """
-    Background thread: validate BOT_TOKEN periodically and start updater as soon as valid.
-    Keeps retrying; does not exit process on Unauthorized.
-    """
     global BOT_TOKEN
-    attempt = 0
     while True:
-        attempt += 1
         if not BOT_TOKEN:
             logger.warning("BOT_TOKEN not set. Waiting for BOT_TOKEN env to be provided.")
             time.sleep(10)
@@ -684,14 +804,12 @@ def token_watcher_loop() -> None:
             logger.info("Bot validated: %s (id=%s)", getattr(me, "username", ""), getattr(me, "id", ""))
             try:
                 bot.delete_webhook()
-                logger.info("Deleted webhook (if any).")
             except Exception:
-                logger.debug("delete_webhook failed or none set.")
-            # Start the updater once validated
+                pass
             start_telegram_updater(bot)
             return
         except Unauthorized as e:
-            logger.error("BOT_TOKEN invalid or unauthorized. Will retry in 20s. Error: %s", e)
+            logger.error("BOT_TOKEN invalid/unauthorized. Will retry in 20s.")
             time.sleep(20)
             continue
         except NetworkError as ne:
@@ -718,17 +836,14 @@ def on_startup_jobs_updater(updater: Updater) -> None:
 
 def main() -> None:
     load_state()
-    # Start token watcher thread; it will start the Updater when token valid
     t = threading.Thread(target=token_watcher_loop, daemon=True)
     t.start()
-    # Keep main alive; also start local polling of MNIT to handle allocations even if telegram not started.
-    logger.info("Service started; token watcher running. Telegram will start automatically when valid token is available.")
+    logger.info("Service running. Telegram will start when BOT_TOKEN is valid.")
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        logger.info("Shutting down (KeyboardInterrupt).")
-    # graceful stop if updater running
+        logger.info("Shutting down.")
     global _updater_global
     with _updater_lock:
         if _updater_global:
