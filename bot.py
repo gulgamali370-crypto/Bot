@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - startup validation + OTP forwarding
+Telegram OTP Receiver Bot - improved matching & /info usage for reliable OTP forwarding
 
-Notes:
-- Validates bot token at startup and deletes any webhook to avoid getUpdates conflicts.
-- If token is invalid you'll get a clear Unauthorized error in logs.
-- Forwards OTP/full message to user and forwarding group (FORWARD_CHAT_ID).
+Key changes:
+- Store normalized (digits-only) form on allocation and keep last 6-10 digits for matching.
+- When polling /mapi/v1/mdashboard/getnum/info, try both (a) no status param and (b) status=success.
+- Match by comparing trailing digits (6..10) to handle formatting/country-code differences.
+- Extract message from common fields and nested structures.
+- Log helpful debug info when no match found to make tuning easy.
+- Forwards OTP + full message to user and forwarding group (FORWARD_CHAT_ID).
+- Keeps copy button UX (alert + plain message).
+
+Env:
+- BOT_TOKEN (required)
+- MNIT_API_KEY (required)
+- FORWARD_CHAT_ID (optional, default -1003379113224)
 """
 import os
 import re
@@ -47,9 +56,9 @@ INFO_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info"
 HEADERS = {"Content-Type": "application/json", "mapikey": MNIT_API_KEY}
 
 STATE_FILE = "state.json"
-POLL_INTERVAL = 12  # seconds between polls
+POLL_INTERVAL = 10  # seconds
 
-# ---------- UI Templates & Buttons ----------
+# ---------- UI / templates ----------
 CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 BUTTON_LABELS = {
@@ -102,7 +111,6 @@ MSG_ALLOCATION_ERROR = (
 )
 
 MSG_COPY_CONFIRM = "✅ Sent — long-press the message or copy from the alert."
-
 MSG_HELPER = "ℹ️ Tip: Use /range 261347435XXX to request numbers in that range."
 
 MAIN_MENU_KEYS = [
@@ -119,8 +127,10 @@ logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log
 logger = logging.getLogger(__name__)
 
 # ---------- State ----------
+# saved state structure per chat:
+# { "range": str, "number": str, "digits": "88017...", "last_digits": ["..."], "country": str, "allocated_at": ts, "status": "...", "otp": Optional[str] }
 state: Dict[str, Dict[str, Any]] = {}
-jobs_registry: Dict[str, Any] = {}  # chat_id_str -> Job object
+jobs_registry: Dict[str, Any] = {}
 
 
 # ---------- Persistence ----------
@@ -154,10 +164,21 @@ def normalize_range(raw: str) -> str:
     return digits[:-3] + "XXX"
 
 
-def digits_only(s: str) -> str:
+def digits_only(s: Optional[str]) -> str:
     if not s:
         return ""
     return re.sub(r"\D", "", str(s))
+
+
+def last_n_variants(s: str, lengths: List[int] = None) -> List[str]:
+    if lengths is None:
+        lengths = [6, 7, 8, 9, 10]
+    d = digits_only(s)
+    out = []
+    for n in lengths:
+        if len(d) >= n:
+            out.append(d[-n:])
+    return out
 
 
 def extract_otp_from_text(text: str) -> Optional[str]:
@@ -188,10 +209,31 @@ def flatten_values(x: Any) -> str:
 
 
 def extract_message_text(entry: Dict[str, Any]) -> str:
+    # try common keys first
     for k in ("message", "sms", "msg", "text", "body", "sms_text", "content"):
         v = entry.get(k)
         if v:
             return flatten_values(v)
+    # search nested dicts for likely text fields
+    def search(obj):
+        if isinstance(obj, dict):
+            for kk, vv in obj.items():
+                if isinstance(vv, (str, int, float)):
+                    if kk.lower() in ("message", "sms", "msg", "text", "body", "content", "description"):
+                        return str(vv)
+                res = search(vv)
+                if res:
+                    return res
+        if isinstance(obj, list):
+            for i in obj:
+                res = search(i)
+                if res:
+                    return res
+        return ""
+    nested = search(entry)
+    if nested:
+        return nested
+    # fallback to flattened entire entry
     return flatten_values(entry)
 
 
@@ -221,8 +263,10 @@ def allocate_number(range_str: str, timeout: int = 30) -> Dict[str, Any]:
     return resp.json()
 
 
-def fetch_info(date_str: str, page: int = 1) -> Dict[str, Any]:
-    params = {"date": date_str, "page": page, "search": "", "status": "success"}
+def fetch_info(date_str: str, page: int = 1, status: Optional[str] = None) -> Dict[str, Any]:
+    params = {"date": date_str, "page": page, "search": ""}
+    if status:
+        params["status"] = status
     resp = requests.get(INFO_URL, headers=HEADERS, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -256,7 +300,7 @@ def make_inline_buttons_for_otp(otp: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-# ---------- Polling job ----------
+# ---------- Polling logic ----------
 def polling_job(context: CallbackContext):
     job_ctx = context.job.context
     chat_id = job_ctx["chat_id"]
@@ -267,102 +311,118 @@ def polling_job(context: CallbackContext):
     if not number:
         return
 
-    logger.info("Polling API for chat=%s number=%s", chat_id, number)
-    num_digits = digits_only(number)
+    num_digits = entry.get("digits") or digits_only(number)
+    last_variants = entry.get("last_variants") or last_n_variants(num_digits)
+    logger.info("Polling for chat=%s number=%s last_variants=%s", chat_id, number, last_variants)
 
-    dates_to_try = []
+    # dates to try: allocated day, today, yesterday
+    dates = []
     allocated_at = entry.get("allocated_at")
     if allocated_at:
         try:
             dt = datetime.fromtimestamp(int(allocated_at), tz=timezone.utc)
-            dates_to_try.append(dt.strftime("%Y-%m-%d"))
+            dates.append(dt.strftime("%Y-%m-%d"))
         except Exception:
             pass
     today = datetime.now(timezone.utc)
-    dates_to_try.append(today.strftime("%Y-%m-%d"))
-    dates_to_try.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
+    dates.append(today.strftime("%Y-%m-%d"))
+    dates.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
 
-    seen_dates = set()
     try:
-        for date_str in dates_to_try:
-            if date_str in seen_dates:
-                continue
-            seen_dates.add(date_str)
-            for page in range(1, 7):
-                try:
-                    j = fetch_info(date_str, page=page)
-                except Exception as e:
-                    logger.debug("fetch_info error for %s page %d: %s", date_str, page, e)
-                    continue
-                data = j.get("data")
-                if not data:
-                    continue
-                entries = data if isinstance(data, list) else [data]
-                for e in entries:
-                    flattened = flatten_values(e)
-                    flattened_digits = digits_only(flattened)
-                    e_number = (e.get("number") or e.get("full_number") or e.get("copy") or "")
-                    e_number_digits = digits_only(e_number)
-                    matched = False
-                    if num_digits:
-                        if num_digits == e_number_digits or num_digits in e_number_digits or num_digits in flattened_digits:
-                            matched = True
-                    if not matched:
-                        alt = num_digits.lstrip("0")
-                        if alt and (alt in flattened_digits):
-                            matched = True
-                    if not matched:
+        for date_str in dates:
+            # try both: no status param (all) and status=success
+            for status in (None, "success"):
+                for page in range(1, 6):
+                    try:
+                        resp = fetch_info(date_str, page=page, status=status)
+                    except Exception as e:
+                        logger.debug("fetch_info failed date=%s page=%d status=%s: %s", date_str, page, status, e)
                         continue
+                    data = resp.get("data")
+                    if not data:
+                        continue
+                    entries = data if isinstance(data, list) else [data]
+                    for api_entry in entries:
+                        # build candidate numbers from entry fields
+                        candidate_fields = []
+                        for fld in ("number", "full_number", "copy"):
+                            v = api_entry.get(fld)
+                            if v:
+                                candidate_fields.append(str(v))
+                        # flatten whole entry also
+                        flat = flatten_values(api_entry)
+                        candidate_fields.append(flat)
+                        matched = False
+                        # compare trailing variants
+                        for cf in candidate_fields:
+                            cf_digits = digits_only(cf)
+                            for v in last_variants:
+                                if v and v in cf_digits:
+                                    matched = True
+                                    break
+                            if matched:
+                                break
+                        if not matched:
+                            continue
 
-                    message_text = extract_message_text(e) or flattened
-                    otp = extract_otp_from_text(message_text) or extract_otp_from_text(flattened)
-                    status_field = (e.get("status") or "") or ""
-                    if otp and not entry.get("otp"):
-                        entry["otp"] = otp
-                        entry["status"] = "success"
-                        save_state()
-                        pretty_number = format_pretty_number(number)
-                        tnow = datetime.now().strftime("%I:%M %p")
-                        sms_text = html.escape(message_text or flattened)
-                        card = MSG_OTP_CARD.format(sep=CARD_SEPARATOR, otp=html.escape(str(otp)), pretty_number=pretty_number, country=entry.get("country", "Unknown"), time=tnow, sms_text=sms_text)
-                        try:
-                            context.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
-                            if message_text:
-                                context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
-                            context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
-                        except Exception as send_err:
-                            logger.warning("Failed to send OTP to user %s: %s", chat_id, send_err)
-                        try:
-                            context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
-                            if message_text:
-                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
-                            context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
-                        except Exception as fg_err:
-                            logger.warning("Failed to forward OTP to group %s: %s", FORWARD_CHAT_ID, fg_err)
-                        job_obj = jobs_registry.pop(str(chat_id), None)
-                        if job_obj:
+                        # matched API entry -> extract message & OTP
+                        message_text = extract_message_text(api_entry) or flat
+                        otp = extract_otp_from_text(message_text) or extract_otp_from_text(flat)
+                        status_field = (api_entry.get("status") or "") or ""
+                        logger.info("Matched entry for chat=%s date=%s page=%d status=%s otp_found=%s", chat_id, date_str, page, status_field, bool(otp))
+
+                        if otp and not entry.get("otp"):
+                            entry["otp"] = otp
+                            entry["status"] = "success"
+                            save_state()
+                            pretty_number = format_pretty_number(number)
+                            tnow = datetime.now().strftime("%I:%M %p")
+                            sms_text = html.escape(message_text or flat)
+                            card = MSG_OTP_CARD.format(sep=CARD_SEPARATOR, otp=html.escape(str(otp)), pretty_number=pretty_number, country=entry.get("country", "Unknown"), time=tnow, sms_text=sms_text)
+                            # send to user
                             try:
-                                job_obj.schedule_removal()
+                                context.bot.send_message(chat_id=chat_id, text=card, parse_mode=ParseMode.HTML, reply_markup=make_inline_buttons_for_otp(otp))
+                                if message_text:
+                                    context.bot.send_message(chat_id=chat_id, text=f"Full message:\n{message_text}")
+                                context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
+                            except Exception as send_err:
+                                logger.warning("Failed sending OTP to user %s: %s", chat_id, send_err)
+                            # forward to group if set
+                            try:
+                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
+                                if message_text:
+                                    context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"Full message:\n{message_text}")
+                                context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
+                            except Exception as fg_err:
+                                logger.warning("Failed forwarding OTP to group %s: %s", FORWARD_CHAT_ID, fg_err)
+                            # stop job
+                            job_obj = jobs_registry.pop(str(chat_id), None)
+                            if job_obj:
+                                try:
+                                    job_obj.schedule_removal()
+                                except Exception:
+                                    pass
+                            return
+
+                        # provider-marked expired/failed
+                        combined = (message_text + " " + flat).lower()
+                        if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
+                            entry["status"] = "expired"
+                            save_state()
+                            pretty_number = format_pretty_number(number)
+                            try:
+                                context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(sep=CARD_SEPARATOR, pretty_number=pretty_number), reply_markup=make_inline_buttons_after_timeout())
                             except Exception:
                                 pass
-                        return
-
-                    combined = (message_text + " " + flattened).lower()
-                    if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in combined or "expired" in combined:
-                        entry["status"] = "expired"
-                        save_state()
-                        pretty_number = format_pretty_number(number)
-                        try:
-                            context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(sep=CARD_SEPARATOR, pretty_number=pretty_number), reply_markup=make_inline_buttons_after_timeout())
-                        except Exception:
-                            pass
-                        job_obj = jobs_registry.pop(str(chat_id), None)
-                        if job_obj:
-                            try:
-                                job_obj.schedule_removal()
-                            except Exception:
-                                pass
-                        return
+                            job_obj = jobs_registry.pop(str(chat_id), None)
+                            if job_obj:
+                                try:
+                                    job_obj.schedule_removal()
+                                except Exception:
+                                    pass
+                            return
+        # If reached here no match found; debug log sample (first few allocations)
+        logger.debug("No matching entries found yet for chat=%s number=%s", chat_id, number)
     except Exception as e:
         logger.warning("Polling job error for chat %s: %s", chat_id, e)
 
@@ -428,9 +488,13 @@ def range_handler(update: Update, context: CallbackContext):
         msg.edit_text(MSG_ALLOCATION_ERROR.format(sep=CARD_SEPARATOR, short_error_message=str(alloc)))
         return
 
+    digits = digits_only(full_number)
+    last_variants = last_n_variants(digits)
     state[str(chat_id)] = {
         "range": rng,
         "number": full_number,
+        "digits": digits,
+        "last_variants": last_variants,
         "country": country,
         "allocated_at": int(time.time()),
         "status": data.get("status", "pending"),
@@ -502,9 +566,13 @@ def callback_query_handler(update: Update, context: CallbackContext):
         data = alloc.get("data", {}) or {}
         full_number = data.get("full_number") or data.get("number") or data.get("copy")
         country = data.get("country") or ent.get("country", "Unknown")
+        digits = digits_only(full_number)
+        last_variants = last_n_variants(digits)
         state[str(chat_id)] = {
             "range": rng,
             "number": full_number,
+            "digits": digits,
+            "last_variants": last_variants,
             "country": country,
             "allocated_at": int(time.time()),
             "status": data.get("status", "pending"),
@@ -593,30 +661,28 @@ def on_startup_jobs_updater(updater: Updater):
 
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set. Set the BOT_TOKEN environment variable.")
+        logger.error("BOT_TOKEN not set. Set BOT_TOKEN env var.")
         sys.exit(1)
     if not MNIT_API_KEY:
-        logger.error("MNIT_API_KEY not set. Set MNIT_API_KEY environment variable.")
+        logger.error("MNIT_API_KEY not set. Set MNIT_API_KEY env var.")
         sys.exit(1)
 
     load_state()
 
-    # Validate token and delete webhook to avoid getUpdates conflicts
     try:
         bot = Bot(BOT_TOKEN)
-        me = bot.get_me()  # will raise Unauthorized if token invalid
-        logger.info("Bot validated: %s (id=%s)", me.username, me.id)
-        # delete webhook if any
+        me = bot.get_me()
+        logger.info("Bot validated: %s (id=%s)", getattr(me, "username", ""), getattr(me, "id", ""))
         try:
             bot.delete_webhook()
-            logger.info("Deleted existing webhook (if any) to allow polling.")
+            logger.info("Deleted existing webhook (if any).")
         except Exception:
-            logger.debug("Could not delete webhook (may not exist).")
+            pass
     except Unauthorized:
-        logger.error("BOT_TOKEN is invalid or unauthorized. Update BOT_TOKEN and restart.")
+        logger.error("BOT_TOKEN invalid/unauthorized. Update token and restart.")
         sys.exit(1)
     except Exception as e:
-        logger.error("Failed to validate bot token: %s", e)
+        logger.error("Failed validating bot token: %s", e)
         sys.exit(1)
 
     updater = Updater(bot=bot, use_context=True)
@@ -634,7 +700,7 @@ def main():
     try:
         updater.start_polling()
     except Conflict:
-        logger.error("Conflict: another getUpdates process is running for this token. Stop other instances or clear getUpdates.")
+        logger.error("Conflict: another getUpdates process is running for this token.")
         sys.exit(1)
     except Unauthorized:
         logger.error("Unauthorized when starting polling; check BOT_TOKEN.")
