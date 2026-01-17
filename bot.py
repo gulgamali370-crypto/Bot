@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - fixed syntax (no lone expressions next to string literals).
-Forwards OTP to user and forwarding group. Shows alert + plain message for copy.
+Telegram OTP Receiver Bot - startup validation + OTP forwarding
+
+Notes:
+- Validates bot token at startup and deletes any webhook to avoid getUpdates conflicts.
+- If token is invalid you'll get a clear Unauthorized error in logs.
+- Forwards OTP/full message to user and forwarding group (FORWARD_CHAT_ID).
 """
 import os
 import re
@@ -11,9 +15,11 @@ import logging
 import html
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
+import sys
 
 import requests
 from telegram import (
+    Bot,
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -28,10 +34,11 @@ from telegram.ext import (
     MessageHandler,
     Filters
 )
+from telegram.error import Unauthorized, Conflict
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "7108794200:AAGD3dLoK6u9FfwOt7eVvRfuT3ZE9Hwyfuw"
-MNIT_API_KEY = os.getenv("MNIT_API_KEY") or "M_WH9Q3U88V"
+BOT_TOKEN = os.getenv("7108794200:AAGD3dLoK6u9FfwOt7eVvRfuT3ZE9Hwyfuw") or ""
+MNIT_API_KEY = os.getenv("M_WH9Q3U88V") or ""
 FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 
 ALLOCATE_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/number"
@@ -75,13 +82,6 @@ MSG_OTP_CARD = (
     "{sep}\n"
     "Message:\n"
     "{sms_text}"
-)
-
-MSG_NO_OTP = (
-    "{sep}\n"
-    "❌ OTP Not Received\n"
-    "{sep}\n"
-    "No message arrived for {pretty_number} within the monitoring period."
 )
 
 MSG_EXPIRED = (
@@ -368,7 +368,7 @@ def polling_job(context: CallbackContext):
 
 
 # ---------- Handlers ----------
-def start(update: Update, context: CallbackContext):
+def start_handler(update: Update, context: CallbackContext):
     try:
         rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
         update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
@@ -592,11 +592,37 @@ def on_startup_jobs_updater(updater: Updater):
 
 
 def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set. Set the BOT_TOKEN environment variable.")
+        sys.exit(1)
+    if not MNIT_API_KEY:
+        logger.error("MNIT_API_KEY not set. Set MNIT_API_KEY environment variable.")
+        sys.exit(1)
+
     load_state()
-    updater = Updater(BOT_TOKEN, use_context=True)
+
+    # Validate token and delete webhook to avoid getUpdates conflicts
+    try:
+        bot = Bot(BOT_TOKEN)
+        me = bot.get_me()  # will raise Unauthorized if token invalid
+        logger.info("Bot validated: %s (id=%s)", me.username, me.id)
+        # delete webhook if any
+        try:
+            bot.delete_webhook()
+            logger.info("Deleted existing webhook (if any) to allow polling.")
+        except Exception:
+            logger.debug("Could not delete webhook (may not exist).")
+    except Unauthorized:
+        logger.error("BOT_TOKEN is invalid or unauthorized. Update BOT_TOKEN and restart.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Failed to validate bot token: %s", e)
+        sys.exit(1)
+
+    updater = Updater(bot=bot, use_context=True)
     dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("start", start_handler))
     dp.add_handler(CommandHandler("range", range_handler))
     dp.add_handler(CommandHandler("status", status_cmd))
     dp.add_handler(CommandHandler("menu", menu_command))
@@ -605,7 +631,15 @@ def main():
     dp.add_handler(CallbackQueryHandler(callback_query_handler))
     dp.add_handler(MessageHandler(Filters.command, unknown))
 
-    updater.start_polling()
+    try:
+        updater.start_polling()
+    except Conflict:
+        logger.error("Conflict: another getUpdates process is running for this token. Stop other instances or clear getUpdates.")
+        sys.exit(1)
+    except Unauthorized:
+        logger.error("Unauthorized when starting polling; check BOT_TOKEN.")
+        sys.exit(1)
+
     on_startup_jobs_updater(updater)
     logger.info("Bot started.")
     updater.idle()
