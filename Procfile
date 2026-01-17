@@ -1,1 +1,1 @@
-web: python test_token.py
+web: python bot.py
