@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - Full updated bot.py with UI/UX improvements only
+Telegram OTP Receiver Bot - Fixed UI + OTP forwarding & status handling
 
-Important:
-- Backend logic, API calls, handlers, persistence and workflows are left intact.
-- Only user-facing messages, button labels, formatting and small UI handlers (copy confirmation, menu, history placeholder)
-  are added/changed. No existing functions renamed or removed.
-- Environment variables:
-    BOT_TOKEN - Telegram bot token (recommended)
-    MNIT_API_KEY - MNIT API key (recommended)
+Changes (UI-only + polling/forwarding fixes):
+- Improved matching when searching messages from the API (compare digit-only forms).
+- Query multiple recent dates (today and yesterday) and more pages to improve hit rate.
+- Use html.escape() when sending raw SMS text in HTML mode.
+- Use CallbackQuery.answer(show_alert=True) to present copyable alerts for number/OTP.
+- Better status text mapping in /status.
+- Minor robustness improvements around job scheduling and cancellations.
+
+Note: Backend API usage/credentials unchanged.
 """
 
 import os
@@ -16,7 +18,8 @@ import re
 import json
 import time
 import logging
-from datetime import datetime, timezone
+import html
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
 import requests
@@ -113,7 +116,7 @@ MSG_ALLOCATION_ERROR = (
     "Tip: Try a different range or try again shortly."
 )
 
-MSG_COPY_CONFIRM = "✅ Copied to clipboard"
+MSG_COPY_CONFIRM = "✅ Copied to clipboard (use the alert to copy)"
 
 MSG_HELPER = "ℹ️ Tip: Use /range 261347435XXX to request numbers in that range."
 
@@ -132,9 +135,6 @@ logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=log
 logger = logging.getLogger(__name__)
 
 # ---------- In-memory state ----------
-# state structure: { chat_id_str: { "range": str, "number": str, "country": str,
-#                                 "allocated_at": ts, "status": "pending|success|failed|expired",
-#                                 "otp": Optional[str] } }
 state: Dict[str, Dict[str, Any]] = {}
 jobs_registry: Dict[str, Any] = {}  # chat_id_str -> Job object
 
@@ -214,6 +214,12 @@ def format_pretty_number(number: str) -> str:
     return f"{plus}{pretty}"
 
 
+def digits_only(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\D", "", str(s))
+
+
 # ---------- MNIT API calls (backend logic preserved) ----------
 def allocate_number(range_str: str, timeout: int = 30) -> Dict[str, Any]:
     payload = {"range": range_str, "is_national": None, "remove_plus": None}
@@ -271,69 +277,103 @@ def polling_job(context: CallbackContext):
         return
 
     logger.info("Polling API for chat=%s number=%s", chat_id, number)
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Try today and yesterday to increase chance of finding SMS
+    dates_to_try = []
+    allocated_at = entry.get("allocated_at")
+    if allocated_at:
+        try:
+            dt = datetime.fromtimestamp(int(allocated_at), tz=timezone.utc)
+            dates_to_try.append(dt.strftime("%Y-%m-%d"))
+        except Exception:
+            pass
+    # always try today and yesterday (UTC)
+    today = datetime.now(timezone.utc)
+    dates_to_try.append(today.strftime("%Y-%m-%d"))
+    dates_to_try.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    checked = set()
+    num_digits = digits_only(number)
+
     try:
-        for page in range(1, 4):
-            j = fetch_info(date_str, page=page)
-            data = j.get("data")
-            if not data:
+        for date_str in dates_to_try:
+            # avoid duplicate date checks
+            if date_str in checked:
                 continue
-            entries = data if isinstance(data, list) else [data]
-            for e in entries:
-                txt = flatten_values(e)
-                if number in txt or number.replace("+", "") in txt:
-                    otp = extract_otp_from_text(txt)
-                    status_field = ""
-                    if isinstance(e, dict):
-                        status_field = e.get("status", "") or ""
-                    if otp and not entry.get("otp"):
-                        entry["otp"] = otp
-                        entry["status"] = "success"
-                        save_state()
-                        pretty_number = format_pretty_number(number)
-                        tnow = datetime.now().strftime("%I:%M %p")
-                        sms_text = txt
-                        # Send OTP Card (UI-only formatting)
-                        context.bot.send_message(
-                            chat_id=chat_id,
-                            text=MSG_OTP_CARD.format(
-                                otp=otp,
-                                pretty_number=pretty_number,
-                                country=entry.get("country", "Unknown"),
-                                time=tnow,
-                                sms_text=sms_text
-                            ),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=make_inline_buttons_for_otp(otp)
-                        )
-                        # Also send concise OTP (preserve previous behavior)
-                        context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{otp}</code>", parse_mode=ParseMode.HTML)
-                        job_obj = jobs_registry.pop(str(chat_id), None)
-                        if job_obj:
+            checked.add(date_str)
+            for page in range(1, 6):  # check more pages to be robust
+                try:
+                    j = fetch_info(date_str, page=page)
+                except Exception as e:
+                    logger.debug("fetch_info error for date %s page %d: %s", date_str, page, e)
+                    continue
+                data = j.get("data")
+                if not data:
+                    continue
+                entries = data if isinstance(data, list) else [data]
+                for e in entries:
+                    txt = flatten_values(e)
+                    txt_digits = digits_only(txt)
+                    # match either raw digits or with plus
+                    if num_digits and (num_digits in txt_digits or num_digits in digits_only(str(e.get("number") or "")) or num_digits in digits_only(str(e.get("copy") or ""))):
+                        otp = extract_otp_from_text(txt)
+                        status_field = ""
+                        if isinstance(e, dict):
+                            status_field = (e.get("status") or "") or ""
+                        if otp and not entry.get("otp"):
+                            entry["otp"] = otp
+                            entry["status"] = "success"
+                            save_state()
+                            pretty_number = format_pretty_number(number)
+                            tnow = datetime.now().strftime("%I:%M %p")
+                            sms_text = html.escape(txt)
+                            # Send OTP Card
                             try:
-                                job_obj.schedule_removal()
+                                context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=MSG_OTP_CARD.format(
+                                        otp=otp,
+                                        pretty_number=pretty_number,
+                                        country=entry.get("country", "Unknown"),
+                                        time=tnow,
+                                        sms_text=sms_text
+                                    ),
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=make_inline_buttons_for_otp(otp)
+                                )
+                                # concise OTP
+                                context.bot.send_message(chat_id=chat_id, text=f"🔐 OTP: <code>{html.escape(otp)}</code>", parse_mode=ParseMode.HTML)
+                            except Exception as send_err:
+                                logger.warning("Failed to send OTP messages: %s", send_err)
+                            job_obj = jobs_registry.pop(str(chat_id), None)
+                            if job_obj:
+                                try:
+                                    job_obj.schedule_removal()
+                                except Exception:
+                                    pass
+                            return
+                        # provider-marked failed/expired
+                        if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in txt.lower() or "expired" in txt.lower():
+                            entry["status"] = "expired"
+                            save_state()
+                            pretty_number = format_pretty_number(number)
+                            try:
+                                context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(pretty_number=pretty_number), reply_markup=make_inline_buttons_after_timeout())
                             except Exception:
                                 pass
-                        return
-                    if "failed" in status_field.lower() or "expired" in status_field.lower() or "failed" in txt.lower() or "expired" in txt.lower():
-                        entry["status"] = "expired"
-                        save_state()
-                        pretty_number = format_pretty_number(number)
-                        context.bot.send_message(chat_id=chat_id, text=MSG_EXPIRED.format(pretty_number=pretty_number), reply_markup=make_inline_buttons_after_timeout())
-                        job_obj = jobs_registry.pop(str(chat_id), None)
-                        if job_obj:
-                            try:
-                                job_obj.schedule_removal()
-                            except Exception:
-                                pass
-                        return
+                            job_obj = jobs_registry.pop(str(chat_id), None)
+                            if job_obj:
+                                try:
+                                    job_obj.schedule_removal()
+                                except Exception:
+                                    pass
+                            return
     except Exception as e:
         logger.warning("Polling job error for chat %s: %s", chat_id, e)
 
 
 # ---------- Telegram Handlers ----------
 def start(update: Update, context: CallbackContext):
-    # Send smart main menu (reply keyboard) as UI improvement, but keep helper.
     try:
         rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
         update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
@@ -351,16 +391,26 @@ def status_cmd(update: Update, context: CallbackContext):
     st = ent.get("status", "pending")
     otp = ent.get("otp")
     pretty_number = format_pretty_number(number)
+
+    # friendly status map
+    status_map = {
+        "pending": STATUS_WAITING,
+        "success": STATUS_RECEIVED,
+        "expired": STATUS_TIMEOUT,
+        "failed": STATUS_TIMEOUT
+    }
+    friendly = status_map.get(st, st.capitalize())
+
     card_text = (
         CARD_SEPARATOR + "\n"
         f"📱 Country: {ent.get('country', 'Unknown')}\n"
         f"📞 Phone: {pretty_number}\n"
         f"🔢 Range: {ent.get('range')}\n"
         CARD_SEPARATOR + "\n"
-        f"Status: {st.capitalize()}"
+        f"Status: {friendly}"
     )
     if otp:
-        card_text += f"\n\n🔐 OTP: <code>{otp}</code>"
+        card_text += f"\n\n🔐 OTP: <code>{html.escape(str(otp))}</code>"
     update.message.reply_text(card_text, reply_markup=make_inline_buttons(number), parse_mode=ParseMode.HTML)
 
 
@@ -404,7 +454,9 @@ def range_handler(update: Update, context: CallbackContext):
     pretty_number = format_pretty_number(full_number)
     msg.edit_text(MSG_ALLOCATION_CARD.format(country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
 
-    if str(chat_id) in jobs_registry:
+    # ensure only one job per chat
+    existing = jobs_registry.get(str(chat_id))
+    if existing:
         logger.info("Job already exists for chat %s", chat_id)
     else:
         job = context.job_queue.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": chat_id})
@@ -415,22 +467,42 @@ def callback_query_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     data = query.data or ""
     chat_id = query.message.chat.id
-    query.answer()
-    # copy number
+
+    # copy number -> show alert with number (user can copy)
     if data.startswith("copy|"):
         _, number = data.split("|", 1)
         pretty = format_pretty_number(number)
-        # send the number (so user can copy) and confirmation (UI-only)
-        context.bot.send_message(chat_id=chat_id, text=f"📋 Number: {pretty}")
-        context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+        try:
+            query.answer(text=f"Number: {pretty}", show_alert=True)
+        except Exception:
+            # fallback: send as message
+            context.bot.send_message(chat_id=chat_id, text=f"📋 Number: {pretty}")
+        # also send confirmation small message
+        try:
+            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+        except Exception:
+            pass
         return
-    # copy otp
+
+    # copy otp -> show alert with otp
     if data.startswith("copyotp|"):
         _, otp = data.split("|", 1)
-        # Send OTP and confirmation
-        context.bot.send_message(chat_id=chat_id, text=f"📋 OTP: <code>{otp}</code>", parse_mode=ParseMode.HTML)
-        context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+        try:
+            query.answer(text=f"OTP: {otp}", show_alert=True)
+        except Exception:
+            context.bot.send_message(chat_id=chat_id, text=f"📋 OTP: <code>{html.escape(otp)}</code>", parse_mode=ParseMode.HTML)
+        try:
+            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
+        except Exception:
+            pass
         return
+
+    # for other actions, acknowledge first (no alert)
+    try:
+        query.answer()
+    except Exception:
+        pass
+
     # change number (allocate new)
     if data == "change":
         ent = state.get(str(chat_id))
@@ -462,10 +534,12 @@ def callback_query_handler(update: Update, context: CallbackContext):
         save_state()
         pretty_number = format_pretty_number(full_number)
         query.edit_message_text(MSG_ALLOCATION_CARD.format(country=country, pretty_number=pretty_number, range=rng), reply_markup=make_inline_buttons(full_number))
+        # ensure job is present
         if str(chat_id) not in jobs_registry:
             job = context.job_queue.run_repeating(polling_job, interval=POLL_INTERVAL, first=5, context={"chat_id": chat_id})
             jobs_registry[str(chat_id)] = job
         return
+
     # cancel number (UI-only; safe: mark expired locally and notify user)
     if data.startswith("cancel|"):
         try:
@@ -473,7 +547,7 @@ def callback_query_handler(update: Update, context: CallbackContext):
         except Exception:
             number = None
         ent = state.get(str(chat_id))
-        if ent and ent.get("number") == number:
+        if ent and (not number or ent.get("number") == number):
             ent["status"] = "expired"
             save_state()
             pretty = format_pretty_number(number or ent.get("number"))
@@ -488,9 +562,9 @@ def callback_query_handler(update: Update, context: CallbackContext):
         else:
             query.edit_message_text("No matching active number to cancel.")
             return
+
     # back to menu
     if data == "back":
-        # Show small back text and helper (UI-only)
         query.edit_message_text("⬅ Back to Menu\nUse /range to allocate or /status to view current number.")
         return
 
@@ -512,14 +586,13 @@ def menu_command(update: Update, context: CallbackContext):
 def history_command(update: Update, context: CallbackContext):
     """Show improved history UI if exists, else placeholder (UI-only)."""
     chat_id = update.effective_chat.id
-    # Collect history from state (simple): show last allocations for this user if present
     ent = state.get(str(chat_id))
     if not ent:
         update.message.reply_text(CARD_SEPARATOR + "\n📜 History\n" + CARD_SEPARATOR + "\nNo history available yet.\nWhen you allocate numbers, they will appear here.")
         return
     pretty_number = format_pretty_number(ent.get("number"))
     allocated_time = datetime.fromtimestamp(ent.get("allocated_at")).strftime("%Y-%m-%d %H:%M:%S")
-    otp_line = f"🔐 OTP: <code>{ent['otp']}</code>" if ent.get("otp") else ""
+    otp_line = f"🔐 OTP: <code>{html.escape(str(ent['otp']))}</code>" if ent.get("otp") else ""
     history_text = (
         CARD_SEPARATOR + "\n"
         f"📞 {pretty_number}\n"
