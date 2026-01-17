@@ -46,7 +46,7 @@ from telegram.ext import (
 from telegram.error import Unauthorized, Conflict
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("7108794200:AAFSb4BzdupzcRb7OCfAykgcDc-ZoFxxIag") or ""
+BOT_TOKEN = os.getenv("7108794200:AAEqPqcD7dNVcG-XcyV9nkVl6vzP5njLoWQ") or ""
 MNIT_API_KEY = os.getenv("M_WH9Q3U88V") or ""
 FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 
