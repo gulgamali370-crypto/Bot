@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram OTP Receiver Bot - Forward OTP to user + group, improved matching
-
-Fixed: string-template syntax (removed invalid expression + implicit literal concatenation).
-Also forwards OTP to user and group, robust matching, copy alert UX.
-
-Env:
-- BOT_TOKEN
-- MNIT_API_KEY
-- FORWARD_CHAT_ID (optional)
+Telegram OTP Receiver Bot - fixed syntax (no lone expressions next to string literals).
+Forwards OTP to user and forwarding group. Shows alert + plain message for copy.
 """
 import os
 import re
@@ -396,11 +389,11 @@ def status_cmd(update: Update, context: CallbackContext):
     status_map = {"pending": "⏳ Waiting for OTP…", "success": "✅ OTP Received", "expired": "❌ Expired"}
     friendly = status_map.get(st, st.capitalize())
     card_text = (
-        CARD_SEPARATOR + "\n"
+        f"{CARD_SEPARATOR}\n"
         f"📱 Country: {ent.get('country', 'Unknown')}\n"
         f"📞 Phone: {pretty_number}\n"
         f"🔢 Range: {ent.get('range')}\n"
-        CARD_SEPARATOR + "\n"
+        f"{CARD_SEPARATOR}\n"
         f"Status: {friendly}"
     )
     if otp:
@@ -568,20 +561,20 @@ def history_command(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     ent = state.get(str(chat_id))
     if not ent:
-        update.message.reply_text(CARD_SEPARATOR + "\n📜 History\n" + CARD_SEPARATOR + "\nNo history available yet.")
+        update.message.reply_text(f"{CARD_SEPARATOR}\n📜 History\n{CARD_SEPARATOR}\nNo history available yet.")
         return
     pretty_number = format_pretty_number(ent.get("number"))
     allocated_time = datetime.fromtimestamp(ent.get("allocated_at")).strftime("%Y-%m-%d %H:%M:%S")
     otp_line = f"🔐 OTP: <code>{html.escape(str(ent['otp']))}</code>" if ent.get("otp") else ""
     history_text = (
-        CARD_SEPARATOR + "\n"
+        f"{CARD_SEPARATOR}\n"
         f"📞 {pretty_number}\n"
         f"🗺 {ent.get('country', 'Unknown')}\n"
         f"🔢 Range: {ent.get('range')}\n"
         f"📅 Allocated: {allocated_time}\n"
         f"🧾 Status: {ent.get('status')}\n"
         f"{otp_line}\n"
-        CARD_SEPARATOR
+        f"{CARD_SEPARATOR}"
     )
     update.message.reply_text(history_text, parse_mode=ParseMode.HTML)
 
