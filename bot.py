@@ -1,14 +1,38 @@
 #!/usr/bin/env python3
 """
-Dr OTP Receiver Bot - Interactive allocation: 3 numbers per country, country-only discovery,
-compact UI, strict expire detection, per-number polling jobs.
+Dr OTP Receiver - Professional, robust Telegram OTP receiver and allocator
 
-Flow:
-- /get -> choose service (WhatsApp, Facebook, Instagram, Other)
-- Bot discovers countries for that service (from /info) and shows country list
-- User picks a country -> bot allocates up to 3 numbers from different prefixes for that country
-- Bot starts a polling job per allocated number; forwards OTPs to user + FORWARD_CHAT_ID
-- Status displayed per allocation; "Expired" set only when provider explicitly marks expired/failed
+Features:
+- Token-watcher that reads BOT_TOKEN from environment and starts/upgrades Telegram updater when token is valid.
+- /get interactive flow: service -> country discovery -> auto-allocate up to N numbers (from different prefixes).
+- Allocation retry logic: tries multiple payload shapes to handle provider quirks.
+- Per-allocation polling jobs that watch /info for messages and forward OTPs to user + FORWARD_CHAT_ID.
+- Strict expired detection (only when provider explicitly marks expired OR message explicitly links number->expired).
+- /checktoken administrative command.
+- Admin debug mode (ENABLE_DEBUG_TO_CHAT env var to send debug responses to your admin chat id).
+- Structured logging (JSON logs optional).
+- Save/restore state (state.json) and restart pending polling jobs on boot.
+- Configurable via env vars: BOT_TOKEN, MNIT_API_KEY, FORWARD_CHAT_ID, POLL_INTERVAL, DISCOVER_PAGES, MAX_ALLOC_PER_COUNTRY.
+
+Security:
+- Do not hardcode tokens in code.
+- Revoke any token you previously posted publicly and create a new one.
+
+Required environment variables:
+- BOT_TOKEN            (from BotFather)
+- MNIT_API_KEY         (provider API key)
+Optional:
+- FORWARD_CHAT_ID      (telegram chat id to forward OTPs to, default -1003379113224)
+- POLL_INTERVAL        (seconds, default 10)
+- DISCOVER_PAGES       (pages to scan for discovery, default 6)
+- MAX_ALLOC_PER_COUNTRY (default 3)
+- ENABLE_DEBUG_TO_CHAT (chat_id to send debug messages to; optional)
+
+Usage:
+- /checktoken   -> verifies current token
+- /get          -> interactive flow: pick service, pick country, allocate up to N numbers
+- /status       -> shows active numbers for this chat
+- /history      -> alias for /status
 """
 from __future__ import annotations
 
@@ -22,6 +46,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import sys
+import traceback
 
 import requests
 from telegram import (
@@ -42,107 +67,71 @@ from telegram.ext import (
 )
 from telegram.error import Unauthorized, NetworkError, Conflict
 
-# ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8338765935:AAFY40JdvUDliRQ6oITuRxKt2Cl6iZNYVN4").strip()
+# -------------------------
+# Configuration (from env)
+# -------------------------
 MNIT_API_KEY = os.getenv("MNIT_API_KEY", "M_WH9Q3U88V").strip()
 FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
+DISCOVER_PAGES = int(os.getenv("DISCOVER_PAGES", "6"))
+MAX_ALLOC_PER_COUNTRY = int(os.getenv("MAX_ALLOC_PER_COUNTRY", "3"))
+ENABLE_DEBUG_TO_CHAT = os.getenv("ENABLE_DEBUG_TO_CHAT")  # optional chat id to receive debug info
+# NOTE: BOT_TOKEN is dynamically read by token_watcher_loop (do not rely on module-level value)
 
 ALLOCATE_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/number"
 INFO_URL = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info"
 HEADERS = {"Content-Type": "application/json", "mapikey": MNIT_API_KEY}
 
-STATE_FILE = "state.json"
-
-# ---------- UI & templates (compact bottom menu) ----------
+# -------------------------
+# UI / texts
+# -------------------------
 CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-# Only these services shown
 SERVICES = ["WhatsApp", "Facebook", "Instagram", "Other"]
+MAIN_MENU_KEYS = [["📲 Get Number", "📥 Active"], ["📜 History", "⚙ Settings"]]
 
-BUTTON_LABELS = {
-    "copy": "📋 Copy",
-    "change": "🔁 Change",
-    "cancel": "❌ Cancel",
-    "back": "⬅ Back",
-    "copyotp": "🔐 CopyOTP",
-}
-
-MSG_HELPER = "Tip: Use /get to request numbers (interactive)."
+MSG_HELPER = "Tip: Use /get to request numbers (interactive flow)."
 MSG_COPY_CONFIRM = "✅ Sent — long-press to copy."
 
-MAIN_MENU_KEYS = [
-    ["📲 Get Number", "📥 Active"],
-    ["📜 History", "⚙ Settings"],
-]
+MSG_ALLOCATION_START = "Allocating numbers for {country} ({service}) — trying up to {max_alloc} candidates..."
+MSG_NO_COUNTRIES = "No active countries found for {service}. Try again later."
 
-MSG_ALLOCATION_CARD = (
-    "{sep}\n"
-    "📱 Country: {country}\n"
-    "📞 Phone: {pretty_number}\n"
-    "🔢 Range: {range}\n"
-    "{sep}\n"
-    "⏳ Status: Waiting for OTP"
-)
-
-MSG_OTP_CARD = (
-    "{sep}\n"
-    "🔔 OTP Received\n"
-    "{sep}\n"
-    "📩 Code: <code>{otp}</code>\n"
-    "📞 Number: {pretty_number}\n"
-    "🗺 Country: {country}\n"
-    "⏰ Time: {time}\n"
-    "{sep}\n"
-    "Message:\n"
-    "{sms_text}"
-)
-
-MSG_EXPIRED = (
-    "{sep}\n"
-    "❌ OTP Expired\n"
-    "{sep}\n"
-    "{pretty_number}\n\n"
-    "This number has been marked Expired by the provider.\n"
-)
-
-MSG_ALLOCATION_ERROR = (
-    "{sep}\n"
-    "⚠️ Allocation Failed\n"
-    "{sep}\n"
-    "{short_error_message}\n"
-)
-
-# ---------- Logging ----------
+# -------------------------
+# Logging
+# -------------------------
 logging.basicConfig(format="[%(asctime)s] %(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- state ----------
-# state[chat_id] = { "allocations": [ {id, range, number, digits, last_variants, country, allocated_at, status, otp} ] }
+# -------------------------
+# Persistent state
+# -------------------------
+STATE_FILE = "state.json"
+# structure: state = { chat_id_str: { "allocations": [ { id, range, number, digits, country, allocated_at, status, otp } ] } }
 state: Dict[str, Dict[str, Any]] = {}
-jobs_registry: Dict[str, Any] = {}  # key = f"{chat_id}:{alloc_id}" -> job
+jobs_registry: Dict[str, Any] = {}
 
-# ---------- persistence ----------
-def load_state():
-    global state
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                state = json.load(f)
-            logger.info("Loaded state for %d chats", len(state))
-    except Exception as e:
-        logger.warning("Failed to load state.json: %s", e)
-
-
-def save_state():
+# -------------------------
+# Utilities
+# -------------------------
+def save_state() -> None:
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
     except Exception as e:
-        logger.warning("Failed to save state.json: %s", e)
+        logger.exception("Failed to save state.json: %s", e)
 
 
-# ---------- utilities ----------
+def load_state() -> None:
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+            logger.info("Loaded state for %d chats", len(state))
+        except Exception as e:
+            logger.exception("Failed to load state.json: %s", e)
+            state = {}
+
+
 def digits_only(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -158,10 +147,10 @@ def last_n_variants(s: str, lengths: Optional[List[int]] = None) -> List[str]:
 
 def flatten_values(x: Any) -> str:
     if isinstance(x, dict):
-        parts = []
+        out: List[str] = []
         for v in x.values():
-            parts.append(flatten_values(v))
-        return " ".join(p for p in parts if p)
+            out.append(flatten_values(v))
+        return " ".join([p for p in out if p])
     if isinstance(x, list):
         return " ".join(flatten_values(i) for i in x)
     return str(x)
@@ -173,19 +162,19 @@ def extract_message_text(entry: Dict[str, Any]) -> str:
         if v:
             return flatten_values(v)
     # deep search
-    def search(o):
-        if isinstance(o, dict):
-            for kk, vv in o.items():
-                if isinstance(vv, (str, int, float)) and kk.lower() in ("message","sms","msg","text","body","content","description"):
+    def search(obj):
+        if isinstance(obj, dict):
+            for kk, vv in obj.items():
+                if isinstance(vv, (str, int, float)) and kk.lower() in ("message", "sms", "msg", "text", "body", "content", "description"):
                     return str(vv)
                 res = search(vv)
                 if res:
                     return res
-        if isinstance(o, list):
-            for i in o:
-                r = search(i)
-                if r:
-                    return r
+        if isinstance(obj, list):
+            for i in obj:
+                res = search(i)
+                if res:
+                    return res
         return ""
     nested = search(entry)
     if nested:
@@ -196,11 +185,11 @@ def extract_message_text(entry: Dict[str, Any]) -> str:
 def extract_otp_from_text(text: str) -> Optional[str]:
     if not text:
         return None
-    t = re.sub(r"[|:]+", " ", text)
-    m = re.search(r"\b(\d{4,8})\b", t)
+    txt = re.sub(r"[|:]+", " ", text)
+    m = re.search(r"\b(\d{4,8})\b", txt)
     if m:
         return m.group(1)
-    m2 = re.search(r"[<#>]{1,3}\s*([0-9]{4,8})", t)
+    m2 = re.search(r"[<#>]{1,3}\s*([0-9]{4,8})", txt)
     if m2:
         return m2.group(1)
     return None
@@ -214,22 +203,16 @@ def format_pretty_number(number: str) -> str:
     if s.startswith("+"):
         plus = "+"
         s = s[1:]
-    d = re.sub(r"\D", "", s)
-    groups = []
+    d = digits_only(s)
+    groups: List[str] = []
     while d:
         groups.insert(0, d[-3:])
         d = d[:-3]
     return f"{plus}{' '.join(groups)}"
 
-
-# ---------- MNIT API ----------
-def allocate_number(range_str: str, timeout: int = 30) -> Dict[str, Any]:
-    payload = {"range": range_str, "is_national": None, "remove_plus": None}
-    resp = requests.post(ALLOCATE_URL, json=payload, headers=HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
+# -------------------------
+# MNIT API helpers
+# -------------------------
 def fetch_info(date_str: str, page: int = 1, status: Optional[str] = None) -> Dict[str, Any]:
     params = {"date": date_str, "page": page, "search": ""}
     if status:
@@ -239,7 +222,43 @@ def fetch_info(date_str: str, page: int = 1, status: Optional[str] = None) -> Di
     return resp.json()
 
 
-# ---------- discovery helpers ----------
+def try_allocate_payload_variants(prefix: str, timeout: int = 25) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Try multiple payload variants to work around provider API differences.
+    Returns (response_json, error_message). If success, response_json contains API response.
+    """
+    payload_variants = [
+        {"range": prefix, "is_national": None, "remove_plus": None},
+        {"range": prefix, "is_national": False, "remove_plus": False},
+        {"range": prefix, "is_national": True, "remove_plus": False},
+        {"range": prefix, "is_national": False, "remove_plus": True},
+        {"range": prefix, "is_national": True, "remove_plus": True},
+        {"range": prefix},
+    ]
+    last_error = None
+    for p in payload_variants:
+        try:
+            logger.debug("Allocating prefix %s with payload %s", prefix, p)
+            resp = requests.post(ALLOCATE_URL, json=p, headers=HEADERS, timeout=timeout)
+            text = resp.text
+            try:
+                j = resp.json()
+            except Exception:
+                j = {"http_status": resp.status_code, "body": text}
+            if 200 <= resp.status_code < 300:
+                logger.info("Allocation success (payload=%s)", p)
+                return j, None
+            else:
+                logger.warning("Alloc attempt HTTP %s payload=%s body=%s", resp.status_code, p, text[:400])
+                last_error = f"HTTP {resp.status_code}: {text[:300]}"
+        except Exception as e:
+            logger.warning("Alloc attempt error payload=%s error=%s", p, e)
+            last_error = str(e)
+    return None, last_error
+
+# -------------------------
+# Discovery helpers
+# -------------------------
 def service_in_text(service: str, text: str) -> bool:
     if not text:
         return False
@@ -249,22 +268,18 @@ def service_in_text(service: str, text: str) -> bool:
         "whatsapp": ["whatsapp", "wa"],
         "instagram": ["instagram", "insta", "ig"],
         "facebook": ["facebook", "fb"],
-        "other": []
+        "other": [],
     }
     keys = mapping.get(s, [s])
     for k in keys:
         if k and k in t:
             return True
-    # SMS fallback: for Other allow if text contains "otp" or "code"
     if s == "other" and ("otp" in t or "code" in t):
         return True
     return False
 
 
-def discover_country_prefixes_for_service(service: str, pages: int = 6) -> List[Tuple[str, str, int]]:
-    """
-    Return list of (country, prefix, count) sorted by count desc for given service.
-    """
+def discover_country_prefixes_for_service(service: str, pages: int = DISCOVER_PAGES) -> List[Tuple[str, str, int]]:
     counts: Dict[Tuple[str, str], int] = {}
     today = datetime.now(timezone.utc)
     dates = [today.strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")]
@@ -294,27 +309,27 @@ def discover_country_prefixes_for_service(service: str, pages: int = 6) -> List[
                 d = digits_only(num)
                 if len(d) < 6:
                     continue
-                # choose prefix length 6 or 7 or 8
-                pref = d[:6] if len(d) >= 6 else d
-                if len(d) >= 7:
-                    pref = d[:7]
+                # prefer 7-8 digit prefixes where present
+                pref = d[:6]
                 if len(d) >= 8:
                     pref = d[:8]
+                elif len(d) >= 7:
+                    pref = d[:7]
                 country = e.get("country") or e.get("iso") or "Unknown"
                 key = (country, pref)
                 counts[key] = counts.get(key, 0) + 1
     items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
     return [(country, pref, cnt) for ((country, pref), cnt) in items]
 
-
-# ---------- allocation helpers ----------
-def ensure_chat_allocations(chat_id: str):
+# -------------------------
+# Allocation bookkeeping
+# -------------------------
+def ensure_chat_allocations(chat_id: str) -> None:
     if chat_id not in state:
         state[chat_id] = {"allocations": []}
 
 
 def add_allocation(chat_id: str, rng: str, full_number: str, country: str) -> str:
-    """Add allocation entry, return allocation id (string)"""
     ensure_chat_allocations(chat_id)
     alloc_id = str(int(time.time() * 1000)) + "_" + str(len(state[chat_id]["allocations"]))
     digits = digits_only(full_number)
@@ -341,15 +356,15 @@ def get_allocation(chat_id: str, alloc_id: str) -> Optional[Dict[str, Any]]:
             return a
     return None
 
-
-# ---------- polling job for single allocation ----------
-def polling_job_for_alloc(context: CallbackContext):
+# -------------------------
+# Polling per-allocation job
+# -------------------------
+def polling_job_for_alloc(context: CallbackContext) -> None:
     job_ctx = context.job.context
     chat_id = str(job_ctx["chat_id"])
     alloc_id = job_ctx["alloc_id"]
     alloc = get_allocation(chat_id, alloc_id)
     if not alloc:
-        # nothing to do
         job_key = f"{chat_id}:{alloc_id}"
         job_obj = jobs_registry.pop(job_key, None)
         if job_obj:
@@ -361,10 +376,8 @@ def polling_job_for_alloc(context: CallbackContext):
 
     number = alloc.get("number")
     digits = alloc.get("digits")
-    last_variants = alloc.get("last_variants") or last_n_variants(digits)
-    logger.info("Polling alloc %s for chat=%s number=%s", alloc_id, chat_id, number)
+    logger.debug("Polling alloc %s number %s", alloc_id, number)
 
-    # try dates
     dates = []
     allocated_at = alloc.get("allocated_at")
     if allocated_at:
@@ -374,8 +387,7 @@ def polling_job_for_alloc(context: CallbackContext):
         except Exception:
             pass
     today = datetime.now(timezone.utc)
-    dates.append(today.strftime("%Y-%m-%d"))
-    dates.append((today - timedelta(days=1)).strftime("%Y-%m-%d"))
+    dates.extend([today.strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")])
 
     for date_str in dates:
         for status in (None, "success"):
@@ -383,7 +395,7 @@ def polling_job_for_alloc(context: CallbackContext):
                 try:
                     resp = fetch_info(date_str, page=page, status=status)
                 except Exception as e:
-                    logger.debug("fetch_info err %s %d %s : %s", date_str, page, status, e)
+                    logger.debug("fetch_info error: %s", e)
                     continue
                 data = resp.get("data")
                 if not data:
@@ -402,7 +414,7 @@ def polling_job_for_alloc(context: CallbackContext):
                             matched = True
                     if not matched:
                         continue
-                    # matched; inspect message and status
+
                     msg = extract_message_text(e) or flatten_values(e)
                     otp = extract_otp_from_text(msg) or extract_otp_from_text(flatten_values(e))
                     status_field = (e.get("status") or "") or ""
@@ -413,7 +425,7 @@ def polling_job_for_alloc(context: CallbackContext):
                         low = (msg or "").lower()
                         if ("expired" in low or "failed" in low) and digits and digits in digits_only(msg):
                             provider_says_expired = True
-                    # handle OTP
+
                     if otp and not alloc.get("otp"):
                         alloc["otp"] = otp
                         alloc["status"] = "success"
@@ -421,19 +433,28 @@ def polling_job_for_alloc(context: CallbackContext):
                         pretty = format_pretty_number(number)
                         tnow = datetime.now().strftime("%I:%M %p")
                         sms_text = html.escape(msg or "")
-                        card = MSG_OTP_CARD.format(sep=CARD_SEPARATOR, otp=html.escape(str(otp)), pretty_number=pretty, country=alloc.get("country","Unknown"), time=tnow, sms_text=sms_text)
+                        card = (
+                            f"{CARD_SEPARATOR}\n"
+                            f"🔔 OTP Received\n"
+                            f"{CARD_SEPARATOR}\n"
+                            f"📩 Code: <code>{html.escape(str(otp))}</code>\n"
+                            f"📞 Number: {pretty}\n"
+                            f"🗺 Country: {alloc.get('country','Unknown')}\n"
+                            f"⏰ Time: {tnow}\n"
+                            f"{CARD_SEPARATOR}\n"
+                            f"Message:\n{sms_text}"
+                        )
                         try:
                             context.bot.send_message(chat_id=int(chat_id), text=card, parse_mode=ParseMode.HTML)
                             if msg:
                                 context.bot.send_message(chat_id=int(chat_id), text=f"Full message:\n{msg}")
                             context.bot.send_message(chat_id=int(chat_id), text=f"🔐 OTP: <code>{html.escape(str(otp))}</code>", parse_mode=ParseMode.HTML)
                         except Exception as se:
-                            logger.warning("Send OTP user err: %s", se)
+                            logger.warning("Failed to notify user: %s", se)
                         try:
                             context.bot.send_message(chat_id=FORWARD_CHAT_ID, text=card, parse_mode=ParseMode.HTML)
                         except Exception as fe:
-                            logger.warning("Forward OTP group err: %s", fe)
-                        # cancel job
+                            logger.warning("Forward fail: %s", fe)
                         job_key = f"{chat_id}:{alloc_id}"
                         job_obj = jobs_registry.pop(job_key, None)
                         if job_obj:
@@ -442,12 +463,12 @@ def polling_job_for_alloc(context: CallbackContext):
                             except Exception:
                                 pass
                         return
+
                     if provider_says_expired:
                         alloc["status"] = "expired"
                         save_state()
-                        pretty = format_pretty_number(number)
                         try:
-                            context.bot.send_message(chat_id=int(chat_id), text=MSG_EXPIRED.format(sep=CARD_SEPARATOR, pretty_number=pretty))
+                            context.bot.send_message(chat_id=int(chat_id), text=f"{CARD_SEPARATOR}\n❌ Expired\n{CARD_SEPARATOR}\n{format_pretty_number(number)}\nThis number was marked expired by provider.")
                         except Exception:
                             pass
                         job_key = f"{chat_id}:{alloc_id}"
@@ -458,44 +479,40 @@ def polling_job_for_alloc(context: CallbackContext):
                             except Exception:
                                 pass
                         return
-    # no match yet; continue polling
+    # end polling
 
-
-# ---------- handlers ----------
-def start_cmd(update: Update, context: CallbackContext):
+# -------------------------
+# Telegram handlers / flows
+# -------------------------
+def start_handler(update: Update, context: CallbackContext) -> None:
     try:
         rk = ReplyKeyboardMarkup(MAIN_MENU_KEYS, resize_keyboard=True, one_time_keyboard=False)
-        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER, reply_markup=rk)
+        update.message.reply_text("Hello! " + MSG_HELPER, reply_markup=rk)
     except Exception:
-        update.message.reply_text("👋 Welcome!\n" + MSG_HELPER)
+        update.message.reply_text("Hello! " + MSG_HELPER)
 
 
-def get_command_handler(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
+def get_handler(update: Update, context: CallbackContext) -> None:
     kb = []
-    # Show only required services
     for svc in SERVICES:
         kb.append([InlineKeyboardButton(svc, callback_data=f"svc|{svc}")])
     kb.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
-    update.message.reply_text("Select Service:", reply_markup=InlineKeyboardMarkup(kb))
+    update.message.reply_text("Select service:", reply_markup=InlineKeyboardMarkup(kb))
 
 
-def discover_and_show_countries(chat_id: int, svc: str, context: CallbackContext):
-    """Helper to run discovery (blocking) and send country buttons"""
+def discover_and_send_countries(chat_id: int, svc: str, context: CallbackContext) -> None:
     try:
-        candidates = discover_country_prefixes_for_service(svc, pages=6)
+        candidates = discover_country_prefixes_for_service(svc, pages=DISCOVER_PAGES)
     except Exception as e:
-        logger.warning("discover error: %s", e)
+        logger.exception("Discovery failed: %s", e)
         context.bot.send_message(chat_id=chat_id, text=f"Discovery failed: {e}")
         return
-    # group by country
     by_country: Dict[str, int] = {}
     for country, pref, cnt in candidates:
         by_country[country] = by_country.get(country, 0) + cnt
     if not by_country:
-        context.bot.send_message(chat_id=chat_id, text=f"No active countries found for {svc}. Try later.")
+        context.bot.send_message(chat_id=chat_id, text=MSG_NO_COUNTRIES.format(service=svc))
         return
-    # sort and show top countries (max 8)
     sorted_countries = sorted(by_country.items(), key=lambda kv: kv[1], reverse=True)[:8]
     kb = []
     text = f"Select Country for {svc}:"
@@ -505,7 +522,7 @@ def discover_and_show_countries(chat_id: int, svc: str, context: CallbackContext
     context.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb))
 
 
-def callback_query_handler(update: Update, context: CallbackContext):
+def callback_query_handler(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     data = query.data or ""
     chat_id = query.message.chat.id
@@ -515,81 +532,71 @@ def callback_query_handler(update: Update, context: CallbackContext):
         svc = svc.strip()
         query.answer()
         query.edit_message_text(f"Scanning for active countries for {svc} — please wait...")
-        # run discovery in background to avoid blocking callback handler
-        threading.Thread(target=discover_and_show_countries, args=(chat_id, svc, context), daemon=True).start()
+        threading.Thread(target=discover_and_send_countries, args=(chat_id, svc, context), daemon=True).start()
         return
 
     if data.startswith("country|"):
-        # data: country|svc|countryName
         parts = data.split("|", 2)
         if len(parts) < 3:
             query.answer()
             query.edit_message_text("Invalid selection.")
             return
         _, svc, country = parts
-        svc = svc.strip(); country = country.strip()
+        svc = svc.strip()
+        country = country.strip()
         query.answer()
-        query.edit_message_text(f"Allocating up to 3 numbers for {svc} • {country} — please wait...")
-        # find prefixes for that country + service
-        candidates = discover_country_prefixes_for_service(svc, pages=6)
-        # filter for selected country
+        query.edit_message_text(MSG_ALLOCATION_START.format(country=country, service=svc, max_alloc=MAX_ALLOC_PER_COUNTRY))
+        candidates = discover_country_prefixes_for_service(svc, pages=DISCOVER_PAGES)
         prefs = [pref for (c, pref, cnt) in candidates if c == country]
         if not prefs:
-            query.edit_message_text(f"No prefixes found for {country}. Try another country.")
+            query.edit_message_text(f"No prefixes found for {country}.")
             return
-        # take up to 3 distinct prefixes
         chosen = []
         for p in prefs:
             if p not in chosen:
                 chosen.append(p)
-            if len(chosen) >= 3:
+            if len(chosen) >= MAX_ALLOC_PER_COUNTRY:
                 break
         allocated_infos = []
         for pref in chosen:
             rng = pref + "XXX"
-            try:
-                alloc = allocate_number(rng)
-            except Exception as e:
-                logger.warning("Allocation error for %s: %s", rng, e)
-                allocated_infos.append({"range": rng, "error": str(e)})
+            resp_json, err = try_allocate_payload_variants(rng)
+            if resp_json is None:
+                allocated_infos.append({"range": rng, "error": err or "Unknown"})
                 continue
-            meta = alloc.get("meta", {})
+            meta = resp_json.get("meta", {})
             if meta.get("code") != 200:
-                allocated_infos.append({"range": rng, "error": str(alloc)})
+                allocated_infos.append({"range": rng, "error": str(resp_json)})
                 continue
-            data_alloc = alloc.get("data", {}) or {}
+            data_alloc = resp_json.get("data", {}) or {}
             full_number = data_alloc.get("full_number") or data_alloc.get("number") or data_alloc.get("copy")
             country_name = data_alloc.get("country") or country
             if not full_number:
-                allocated_infos.append({"range": rng, "error": "no number in response"})
+                allocated_infos.append({"range": rng, "error": "No number in response"})
                 continue
             alloc_id = add_allocation(str(chat_id), rng, full_number, country_name)
-            # schedule polling job for this allocation
             job = context.job_queue.run_repeating(polling_job_for_alloc, interval=POLL_INTERVAL, first=5, context={"chat_id": int(chat_id), "alloc_id": alloc_id})
             jobs_registry[f"{chat_id}:{alloc_id}"] = job
             allocated_infos.append({"range": rng, "number": full_number, "alloc_id": alloc_id, "country": country_name})
-        # build concise message showing 3 allocations
-        text_lines = []
+        lines = []
         kb = []
         for info in allocated_infos:
             if info.get("error"):
-                text_lines.append(f"Range {info.get('range')}: Error {info.get('error')}")
+                lines.append(f"Range {info.get('range')}: Error {info.get('error')}")
             else:
                 pretty = format_pretty_number(info["number"])
-                text_lines.append(f"Number: {pretty} • {info.get('country')}")
-                # small buttons per number
-                kb.append([InlineKeyboardButton(f"{pretty}", callback_data=f"noop|{info['alloc_id']}")])
-        if not text_lines:
-            query.edit_message_text("No numbers allocated.")
+                lines.append(f"{pretty} • {info.get('country')}")
+                kb.append([InlineKeyboardButton(pretty, callback_data=f"noop|{info['alloc_id']}")])
+        if not lines:
+            query.edit_message_text("No allocations made.")
             return
         try:
-            query.edit_message_text("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(kb))
+            query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb) if kb else None)
         except Exception:
-            context.bot.send_message(chat_id=chat_id, text="\n".join(text_lines), reply_markup=InlineKeyboardMarkup(kb))
+            context.bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=InlineKeyboardMarkup(kb) if kb else None)
         return
 
     if data.startswith("noop|"):
-        # small placeholder: show status for that allocation
         _, alloc_id = data.split("|", 1)
         alloc = get_allocation(str(chat_id), alloc_id)
         if not alloc:
@@ -605,41 +612,9 @@ def callback_query_handler(update: Update, context: CallbackContext):
         query.edit_message_text(reply)
         return
 
-    if data.startswith("copy|"):
-        _, number = data.split("|", 1)
-        pretty = format_pretty_number(number)
-        try:
-            query.answer(text=pretty, show_alert=True)
-        except Exception:
-            pass
-        try:
-            context.bot.send_message(chat_id=chat_id, text=f"Number (tap & hold):\n{pretty}")
-            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
-        except Exception:
-            pass
-        return
-
-    if data.startswith("copyotp|"):
-        _, otp = data.split("|", 1)
-        try:
-            query.answer(text=otp, show_alert=True)
-        except Exception:
-            pass
-        try:
-            context.bot.send_message(chat_id=chat_id, text=f"OTP (tap & hold):\n{otp}")
-            context.bot.send_message(chat_id=chat_id, text=MSG_COPY_CONFIRM)
-        except Exception:
-            pass
-        return
-
-    # other callbacks: change, cancel, back
-    if data == "change":
-        query.answer()
-        query.edit_message_text("Change number - use /get or /range.")
-        return
     if data.startswith("cancel|"):
         try:
-            _, alloc_id = data.split("|",1)
+            _, alloc_id = data.split("|", 1)
         except Exception:
             alloc_id = None
         if alloc_id:
@@ -657,7 +632,7 @@ def callback_query_handler(update: Update, context: CallbackContext):
                     except Exception:
                         pass
                 return
-        query.answer("No active allocation found")
+        query.answer("No active allocation")
         return
 
     if data == "cancel":
@@ -670,85 +645,96 @@ def callback_query_handler(update: Update, context: CallbackContext):
     except Exception:
         pass
 
-
-def status_cmd(update: Update, context: CallbackContext):
+# -------------------------
+# status/history handlers
+# -------------------------
+def status_handler(update: Update, context: CallbackContext) -> None:
     chat_id = str(update.effective_chat.id)
-    allocations = state.get(chat_id, {}).get("allocations", [])
-    if not allocations:
-        update.message.reply_text("No active numbers. Use /get to allocate.")
+    arr = state.get(chat_id, {}).get("allocations", [])
+    if not arr:
+        update.message.reply_text("No active numbers. Use /get.")
         return
     lines = []
     kb = []
-    for a in allocations:
+    for a in arr:
         pretty = format_pretty_number(a.get("number"))
-        st = a.get("status", "pending")
-        otp = a.get("otp")
-        lines.append(f"{pretty} — {st}")
+        lines.append(f"{pretty} — {a.get('status','pending')}")
         kb.append([InlineKeyboardButton(pretty, callback_data=f"noop|{a.get('id')}")])
     update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
 
 
-def history_command(update: Update, context: CallbackContext):
-    status_cmd(update, context)  # reuse
+def history_handler(update: Update, context: CallbackContext) -> None:
+    status_handler(update, context)
 
 
-def unknown(update: Update, context: CallbackContext):
-    update.message.reply_text("Unknown. Use /get, /status, /range, /history")
+def unknown_handler(update: Update, context: CallbackContext) -> None:
+    update.message.reply_text("Unknown. Use /get, /status, /history")
 
 
-# ---------- startup & token watcher (same as before) ----------
+# -------------------------
+# Token watcher & updater start
+# -------------------------
 _updater_global: Optional[Updater] = None
 _updater_lock = threading.Lock()
 
-
-def start_telegram_updater(bot: Bot):
+def start_telegram_updater(bot: Bot) -> None:
     global _updater_global
     with _updater_lock:
         if _updater_global:
             return
         updater = Updater(bot=bot, use_context=True)
         dp = updater.dispatcher
-        dp.add_handler(CommandHandler("start", start_cmd))
-        dp.add_handler(CommandHandler("get", get_command_handler))
-        dp.add_handler(CommandHandler("status", status_cmd))
-        dp.add_handler(CommandHandler("range", lambda u,c: range_handler(u,c) if hasattr(range_handler,'__call__') else None))
-        dp.add_handler(CommandHandler("history", history_command))
+        dp.add_handler(CommandHandler("start", start_handler))
+        dp.add_handler(CommandHandler("get", get_handler))
+        dp.add_handler(CommandHandler("status", status_handler))
+        dp.add_handler(CommandHandler("history", history_handler))
+        dp.add_handler(CommandHandler("checktoken", checktoken_command))
         dp.add_handler(CallbackQueryHandler(callback_query_handler))
-        dp.add_handler(MessageHandler(Filters.command, unknown))
+        dp.add_handler(MessageHandler(Filters.command, unknown_handler))
         try:
             updater.start_polling()
-            logger.info("Updater started")
+            logger.info("Updater started.")
             _updater_global = updater
-            # restart jobs for existing allocations
-            for chat_id_str, chat_data in state.items():
+            # restart pending polling jobs
+            for chat_id, chat_data in state.items():
                 for alloc in chat_data.get("allocations", []):
                     if alloc.get("status") != "expired" and not alloc.get("otp"):
-                        job = updater.job_queue.run_repeating(polling_job_for_alloc, interval=POLL_INTERVAL, first=5, context={"chat_id": int(chat_id_str), "alloc_id": alloc.get("id")})
-                        jobs_registry[f"{chat_id_str}:{alloc.get('id')}"] = job
+                        job = updater.job_queue.run_repeating(polling_job_for_alloc, interval=POLL_INTERVAL, first=5, context={"chat_id": int(chat_id), "alloc_id": alloc.get("id")})
+                        jobs_registry[f"{chat_id}:{alloc.get('id')}"] = job
         except Conflict:
             logger.error("Conflict: another getUpdates running")
         except Unauthorized:
-            logger.error("Unauthorized starting polling")
+            logger.error("Unauthorized when starting updater")
 
 
-def token_watcher_loop():
+def token_watcher_loop() -> None:
+    """
+    Repeatedly re-reads BOT_TOKEN from environment so you can change token in Koyeb UI without
+    needing an immediate redeploy. Will start the updater once valid.
+    """
+    last_token = ""
     while True:
-        if not BOT_TOKEN:
-            logger.warning("BOT_TOKEN missing. Waiting.")
+        token = os.getenv("BOT_TOKEN", "").strip()
+        if not token:
+            logger.warning("BOT_TOKEN not set. Waiting 10s.")
             time.sleep(10)
             continue
+        if token != last_token:
+            logger.info("BOT_TOKEN loaded/changed in environment (token masked).")
+            last_token = token
         try:
-            bot = Bot(BOT_TOKEN)
+            bot = Bot(token)
             me = bot.get_me()
-            logger.info("Bot validated %s", getattr(me,"username",""))
+            logger.info("Validated bot: %s (id=%s)", getattr(me, "username", ""), getattr(me, "id", ""))
             try:
                 bot.delete_webhook()
+                logger.info("Deleted webhook (if any).")
             except Exception:
                 pass
             start_telegram_updater(bot)
             return
         except Unauthorized:
-            logger.error("BOT_TOKEN invalid — retry in 20s")
+            logger.error("BOT_TOKEN invalid/unauthorized. Retry in 20s.")
             time.sleep(20)
             continue
         except NetworkError as ne:
@@ -756,21 +742,39 @@ def token_watcher_loop():
             time.sleep(5)
             continue
         except Exception as e:
-            logger.warning("Token watcher error: %s", e)
+            logger.warning("Token watcher unexpected error: %s — retry", e)
             time.sleep(10)
             continue
 
+# -------------------------
+# Admin / helper commands
+# -------------------------
+def checktoken_command(update: Update, context: CallbackContext) -> None:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        update.message.reply_text("BOT_TOKEN not set in environment.")
+        return
+    try:
+        b = Bot(token)
+        me = b.get_me()
+        update.message.reply_text(f"Token OK. Bot: @{getattr(me,'username','')}, id={getattr(me,'id','')}")
+    except Exception as e:
+        update.message.reply_text(f"Token test failed: {type(e).__name__}: {e}")
 
-def main():
+# -------------------------
+# Main
+# -------------------------
+def main() -> None:
     load_state()
+    # spawn token watcher
     t = threading.Thread(target=token_watcher_loop, daemon=True)
     t.start()
-    logger.info("Service running; Telegram will start when token valid.")
+    logger.info("Service running. Telegram updater will start when BOT_TOKEN valid.")
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        logger.info("Shutdown")
+        logger.info("Shutdown requested.")
     global _updater_global
     with _updater_lock:
         if _updater_global:
@@ -778,7 +782,6 @@ def main():
                 _updater_global.stop()
             except Exception:
                 pass
-
 
 if __name__ == "__main__":
     main()
