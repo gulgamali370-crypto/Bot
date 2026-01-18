@@ -43,7 +43,7 @@ from telegram.ext import (
 from telegram.error import Unauthorized, NetworkError, Conflict
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8338765935:AAHnYQZjI7vlPf26RkaXnioKenEMp7RauPU").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8338765935:AAFTjPLj5-LimscTyf1Zs9Jn4Ckt6X84POU").strip()
 MNIT_API_KEY = os.getenv("MNIT_API_KEY", "M_WH9Q3U88V").strip()
 FORWARD_CHAT_ID = int(os.getenv("FORWARD_CHAT_ID", "-1003379113224"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
